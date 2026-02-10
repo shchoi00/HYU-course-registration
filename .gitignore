@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+config.json
+network_capture.json
+network_login.json
+secrets.json
+.DS_Store
