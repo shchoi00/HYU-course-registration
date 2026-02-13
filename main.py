@@ -335,11 +335,35 @@ def fetch_course_list(session, tokens):
     return courses
 
 
-def find_course_info(courses, haksu_no):
-    """학수번호로 과목 정보를 찾는다."""
+def find_course_info(courses, course_id):
+    """학수번호 또는 학수번호+수업번호로 과목 정보를 찾는다.
+
+    Args:
+        courses (list): 희망수업 목록
+        course_id (str or dict): 검색할 과목 정보
+            - str: 학수번호 (예: "COE8042") -> 첫 번째 일치하는 과목 반환
+            - dict: {"haksuNo": "COE8042", "suupNo": "30016"} -> 두 조건 모두 일치하는 과목 반환
+    """
+    target_haksu = ""
+    target_suup = ""
+
+    if isinstance(course_id, dict):
+        target_haksu = course_id.get("haksuNo", "")
+        target_suup = course_id.get("suupNo", "")
+    else:
+        target_haksu = str(course_id)
+
     for c in courses:
-        if c.get("haksuNo") == haksu_no:
-            return c
+        # 1. 학수번호 불일치 시 건너뜀
+        if c.get("haksuNo") != target_haksu:
+            continue
+
+        # 2. 수업번호가 지정된 경우, 수업번호도 일치해야 함
+        if target_suup and str(c.get("suupNo")) != str(target_suup):
+            continue
+
+        return c
+
     return None
 
 
@@ -429,13 +453,22 @@ def main():
 
     # 5. 수강신청 대상 과목 매칭
     target_courses = []
-    for haksu_no in config.get("courses", []):
-        info = find_course_info(courses, haksu_no)
+    for course_config in config.get("courses", []):
+        info = find_course_info(courses, course_config)
+        
+        # 로깅용 학수번호 식별
+        if isinstance(course_config, dict):
+            req_haksu = course_config.get("haksuNo", "?")
+            req_suup = course_config.get("suupNo", "")
+            req_desc = f"{req_haksu}" + (f"(수업번호:{req_suup})" if req_suup else "")
+        else:
+            req_desc = str(course_config)
+
         if info:
             target_courses.append(info)
-            log(f"대상 과목 확인: {haksu_no} - {info.get('gwamokNm', '?')}", "green")
+            log(f"대상 과목 확인: {req_desc} -> {info.get('gwamokNm', '?')} (수업번호: {info.get('suupNo')})", "green")
         else:
-            log(f"과목을 찾을 수 없음: {haksu_no} (희망수업에 등록되어 있는지 확인)", "red")
+            log(f"과목을 찾을 수 없음: {req_desc} (희망수업에 등록되어 있는지 확인)", "red")
 
     if not target_courses:
         log("수강신청할 과목이 없습니다.", "red")

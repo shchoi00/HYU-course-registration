@@ -63,7 +63,10 @@
    ```json
    {
      "login_mode": "sso",
-     "courses": ["COE8042"], // 신청할 학수번호 리스트
+     "courses": [
+       "COE8042", // 학수번호만 입력 (첫 번째 분반 선택)
+       {"haksuNo": "COE9013", "suupNo": "30030"} // 학수번호 + 수업번호 입력 (특정 분반 선택)
+     ],
      "schedule": {
        "enabled": true,
        "start_time": "2026-02-10 10:00:00"
