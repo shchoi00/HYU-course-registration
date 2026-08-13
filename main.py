@@ -764,7 +764,7 @@ def run_application(
         log(f"인증을 완료하지 못했습니다: {error}", "red")
         return 1
 
-    tokens, wishlist = fetch_context(session)
+    _tokens, wishlist = fetch_context(session)
     if not wishlist:
         log("희망수업이 없습니다. 포털에서 희망수업을 먼저 등록해주세요.", "red")
         return 1

@@ -68,9 +68,8 @@ class TestCredentialStore(unittest.TestCase):
                     raise OSError("token write failed")
                 original_atomic_write(path, data)
 
-            with patch("credentials._atomic_write", side_effect=fail_token_write):
-                with self.assertRaises(OSError):
-                    store.save({"user_id": "u", "password": "p"})
+            with patch("credentials._atomic_write", side_effect=fail_token_write), self.assertRaises(OSError):
+                store.save({"user_id": "u", "password": "p"})
 
             self.assertFalse(store.paths.key_path.exists())
             self.assertFalse(store.paths.token_path.exists())
@@ -97,9 +96,8 @@ class TestCredentialStore(unittest.TestCase):
                     raise OSError("token write failed")
                 original_atomic_write(path, data)
 
-            with patch("credentials._atomic_write", side_effect=fail_token_write):
-                with self.assertRaises(OSError):
-                    store.save({"user_id": "u", "password": "p"})
+            with patch("credentials._atomic_write", side_effect=fail_token_write), self.assertRaises(OSError):
+                store.save({"user_id": "u", "password": "p"})
 
             self.assertEqual(store.paths.key_path.read_bytes(), original_key)
             self.assertEqual(store.paths.token_path.read_bytes(), original_token)

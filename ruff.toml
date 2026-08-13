@@ -1,0 +1,4 @@
+target-version = "py39"
+
+[lint]
+per-file-ignores = { "tests/test_application.py" = ["DTZ001"], "tests/test_workflow.py" = ["DTZ001"] }

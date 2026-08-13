@@ -1,8 +1,7 @@
+import math
 from dataclasses import dataclass
 from datetime import datetime
-import math
 from typing import Literal
-
 
 AttemptStatus = Literal["success", "retry"]
 

@@ -1,7 +1,7 @@
-from datetime import datetime, timedelta
 import os
 import sys
 import unittest
+from datetime import datetime, timedelta
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

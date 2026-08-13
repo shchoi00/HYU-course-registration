@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import tempfile
@@ -44,7 +46,7 @@ class CredentialStore:
     def __init__(self, paths: CredentialPaths):
         self.paths = paths
 
-    def load(self) -> Optional[dict[str, str]]:
+    def load(self) -> Optional[dict[str, str]]:  # noqa: UP045
         key_exists = self.paths.key_path.exists()
         token_exists = self.paths.token_path.exists()
 
@@ -89,7 +91,7 @@ class CredentialStore:
                     _atomic_write(self.paths.key_path, previous_key)
             raise
 
-    def _load_or_create_key(self) -> tuple[bytes, bool, Optional[bytes]]:
+    def _load_or_create_key(self) -> tuple[bytes, bool, Optional[bytes]]:  # noqa: UP045
         if self.paths.key_path.exists():
             key = self.paths.key_path.read_bytes()
             try:
@@ -179,7 +181,7 @@ def _validate_candidate(
     credentials,
     validate_credentials,
     migrated_legacy: bool,
-) -> Optional[ValidatedCredentials]:
+) -> Optional[ValidatedCredentials]:  # noqa: UP045
     if credentials is None:
         return None
 

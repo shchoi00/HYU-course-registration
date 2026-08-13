@@ -16,8 +16,8 @@ from main import (
     attempt_registration_course,
     classify_registration_result,
     load_authentication,
-    run_application,
     order_courses_by_priority,
+    run_application,
     select_target_courses,
 )
 from workflow import run_ticketing
