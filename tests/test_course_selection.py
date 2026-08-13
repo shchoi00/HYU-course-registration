@@ -1,11 +1,12 @@
-import sys
 import os
+import sys
 import unittest
 
 # Add parent directory to path to import main
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from main import find_course_info
+
 
 class TestCourseSelection(unittest.TestCase):
     def setUp(self):

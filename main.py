@@ -3,15 +3,13 @@
 
 import base64
 import json
-import math
 import os
 import re
-import time
 import sys
+import time
 from datetime import datetime
 
 import requests
-
 
 BASE_URL = "https://portal.hanyang.ac.kr/sugang"
 NF_SETTING_URL = "https://nf-setting-bucket.stclab.com/hynfad-3391.netfunnel/nf-setting.json"
@@ -222,8 +220,6 @@ def extract_tokens(session):
     # 사용자 정보 추출
     gaein_match = re.search(r'gaeinNo\s*:\s*"(\d+)"', html)
     sosok_match = re.search(r'sosokCd\s*:\s*"([^"]+)"', html)
-    grade_match = re.search(r'strGrade.*?["\'](\d)["\']', html)
-
     info = {
         "tk": tk,
         "pgmId": "P310298",
@@ -367,6 +363,103 @@ def find_course_info(courses, course_id):
     return None
 
 
+def order_courses_by_priority(courses, choose_course):
+    """선택된 과목을 사용자가 지정한 우선순위로 정렬한다."""
+    remaining = list(courses)
+    ordered = []
+
+    while len(remaining) > 1:
+        priority = len(ordered) + 1
+        selected = choose_course(priority, tuple(remaining))
+        if selected is None:
+            return None
+        ordered.append(selected)
+        remaining.remove(selected)
+
+    return ordered + remaining
+
+
+def select_target_courses(courses, questionary_module=None):
+    """희망수업에서 신청 대상을 고르고 우선순위를 지정한다."""
+    if questionary_module is None:
+        import questionary as questionary_module
+
+    def choice(course):
+        title = (
+            f"{course.get('gwamokNm', '?')} | {course.get('haksuNo', '?')} "
+            f"| 수업번호 {course.get('suupNo', '?')}"
+        )
+        return questionary_module.Choice(title=title, value=course)
+
+    selected = questionary_module.checkbox(
+        "신청할 희망수업을 선택하세요 (Space 선택, Enter 완료)",
+        choices=[choice(course) for course in courses],
+    ).ask()
+    if not selected:
+        return selected
+
+    def choose_priority(priority, remaining):
+        return questionary_module.select(
+            f"{priority}순위 과목을 선택하세요",
+            choices=[choice(course) for course in remaining],
+        ).ask()
+
+    return order_courses_by_priority(selected, choose_priority)
+
+
+def run_registration_round_robin(
+    courses,
+    max_attempts,
+    attempt_course,
+    wait_for_next_round=lambda: None,
+    on_attempt_error=None,
+):
+    """우선순위 순으로 과목별 한 번씩 신청하며 실패 과목만 재시도한다."""
+    if max_attempts < 1:
+        raise ValueError("max_attempts는 1 이상이어야 합니다.")
+
+    states = [
+        {"course": course, "attempts": 0, "status": None}
+        for course in courses
+    ]
+    pending = list(states)
+
+    while pending:
+        next_round = []
+        for state in pending:
+            state["attempts"] += 1
+            try:
+                status = attempt_course(state["course"], state["attempts"])
+            except requests.RequestException as error:
+                if on_attempt_error:
+                    on_attempt_error(state["course"], state["attempts"], error)
+                status = "retry"
+
+            if status == "retry" and state["attempts"] < max_attempts:
+                next_round.append(state)
+            elif status == "retry":
+                state["status"] = "failed"
+            elif status == "success":
+                state["status"] = status
+            else:
+                raise ValueError(f"알 수 없는 신청 상태: {status}")
+
+        pending = next_round
+        if pending:
+            wait_for_next_round()
+
+    return states
+
+
+def classify_registration_result(out_code, out_msg):
+    """수강신청 응답을 라운드 로빈 실행 상태로 변환한다."""
+    if "이미" in out_msg and "신청" in out_msg:
+        return "success"
+    if out_code in ("", "SUCCESS", "S") or "성공" in out_msg or "완료" in out_msg:
+        return "success"
+    return "retry"
+
+
 def register_course(session, tokens, course_info, nf_key):
     """수강신청을 요청한다."""
     url = f"{BASE_URL}/SgscAct/hyuHaksaengSgsc.do?pgmId={tokens['pgmId']}&menuId={tokens['menuId']}&tk={tokens['tk']}"
@@ -434,91 +527,99 @@ def main():
     config = load_config()
     log("=== 한양대학교 수강신청 자동화 ===", "cyan")
 
-    # 1. 스케줄링
-    if config.get("schedule", {}).get("enabled"):
-        wait_until(config["schedule"]["start_time"])
-
-    # 2. 로그인
+    # 1. 로그인
     session = create_session(config)
 
-    # 3. 토큰 추출
+    # 2. 토큰 추출
     tokens = extract_tokens(session)
 
-    # 4. 희망수업 조회
+    # 3. 희망수업 조회
     courses = fetch_course_list(session, tokens)
 
     if not courses:
         log("희망수업이 없습니다. 포털에서 희망수업을 먼저 등록해주세요.", "red")
         sys.exit(1)
 
-    # 5. 수강신청 대상 과목 매칭
-    target_courses = []
-    for course_config in config.get("courses", []):
-        info = find_course_info(courses, course_config)
-        
-        # 로깅용 학수번호 식별
-        if isinstance(course_config, dict):
-            req_haksu = course_config.get("haksuNo", "?")
-            req_suup = course_config.get("suupNo", "")
-            req_desc = f"{req_haksu}" + (f"(수업번호:{req_suup})" if req_suup else "")
-        else:
-            req_desc = str(course_config)
-
-        if info:
-            target_courses.append(info)
-            log(f"대상 과목 확인: {req_desc} -> {info.get('gwamokNm', '?')} (수업번호: {info.get('suupNo')})", "green")
-        else:
-            log(f"과목을 찾을 수 없음: {req_desc} (희망수업에 등록되어 있는지 확인)", "red")
+    # 4. 신청 대상 및 우선순위 선택
+    target_courses = select_target_courses(courses)
 
     if not target_courses:
-        log("수강신청할 과목이 없습니다.", "red")
+        log("선택된 과목이 없습니다. 실행을 종료합니다.", "yellow")
         sys.exit(1)
 
-    # 6. 수강신청 실행 (재시도 포함)
+    log("신청 우선순위", "cyan")
+    for priority, course in enumerate(target_courses, start=1):
+        log(
+            f"  {priority}순위: {course.get('gwamokNm', '?')} "
+            f"({course.get('haksuNo', '?')}, 수업번호 {course.get('suupNo', '?')})",
+            "cyan",
+        )
+
+    # 5. 예약 시간까지 대기
+    if config.get("schedule", {}).get("enabled"):
+        wait_until(config["schedule"]["start_time"])
+
+    # 6. 우선순위 라운드 로빈 수강신청
     max_attempts = config.get("retry", {}).get("max_attempts", 50)
     interval = config.get("retry", {}).get("interval_seconds", 0.5)
 
-    for course in target_courses:
+    def attempt_course(course, attempt):
         haksu_no = course.get("haksuNo", "?")
         gwamok_nm = course.get("gwamokNm", "?")
-        log(f"\n{'='*50}", "cyan")
-        log(f"수강신청 시작: {haksu_no} - {gwamok_nm}", "cyan")
+        log(f"[{attempt}/{max_attempts}] 신청 시도: {haksu_no} - {gwamok_nm}", "cyan")
 
-        success = False
-        for attempt in range(1, max_attempts + 1):
-            # NetFunnel 키 발급
-            nf_key = get_netfunnel_key(session)
-            if not nf_key:
-                log(f"[{attempt}/{max_attempts}] NetFunnel 키 발급 실패, 재시도...", "yellow")
-                time.sleep(interval)
-                continue
+        nf_key = get_netfunnel_key(session)
+        if not nf_key:
+            log(f"[{attempt}/{max_attempts}] NetFunnel 키 발급 실패", "yellow")
+            return "retry"
 
-            # 수강신청 요청
-            out_code, out_msg, result = register_course(session, tokens, course, nf_key)
-
-            # NetFunnel 키 해제
+        try:
+            out_code, out_msg, _ = register_course(
+                session,
+                tokens,
+                course,
+                nf_key,
+            )
+        finally:
             release_netfunnel_key(session, nf_key)
 
-            log(f"[{attempt}/{max_attempts}] 응답: [{out_code}] {out_msg}")
+        log(f"[{attempt}/{max_attempts}] 응답: [{out_code}] {out_msg}")
+        status = classify_registration_result(out_code, out_msg)
 
-            # 성공 판단
-            if out_code in ("", "SUCCESS", "S") or "성공" in out_msg or "완료" in out_msg:
-                log(f"수강신청 성공! {haksu_no} - {gwamok_nm}", "green")
-                success = True
-                break
-            elif out_code == "M77":
-                log("수강신청 기간이 아닙니다.", "red")
-                break
-            elif "이미" in out_msg and "신청" in out_msg:
+        if status == "success":
+            if "이미" in out_msg and "신청" in out_msg:
                 log(f"이미 신청된 과목입니다: {haksu_no}", "yellow")
-                success = True
-                break
             else:
-                if attempt < max_attempts:
-                    time.sleep(interval)
+                log(f"수강신청 성공! {haksu_no} - {gwamok_nm}", "green")
+        elif out_code == "M77":
+            log("수강신청 기간이 아닙니다. 다음 라운드에서 재시도합니다.", "yellow")
 
-        if not success:
-            log(f"수강신청 실패: {haksu_no} - {gwamok_nm} ({max_attempts}회 시도)", "red")
+        return status
+
+    def log_attempt_error(course, attempt, error):
+        log(
+            f"[{attempt}/{max_attempts}] 요청 오류: "
+            f"{course.get('haksuNo', '?')} - {error}. 다음 라운드에서 재시도합니다.",
+            "yellow",
+        )
+
+    results = run_registration_round_robin(
+        target_courses,
+        max_attempts=max_attempts,
+        attempt_course=attempt_course,
+        wait_for_next_round=lambda: time.sleep(interval),
+        on_attempt_error=log_attempt_error,
+    )
+
+    for result in results:
+        if result["status"] != "failed":
+            continue
+        course = result["course"]
+        log(
+            f"수강신청 실패: {course.get('haksuNo', '?')} - "
+            f"{course.get('gwamokNm', '?')} ({result['attempts']}회 시도)",
+            "red",
+        )
 
     log(f"\n{'='*50}", "cyan")
     log("수강신청 자동화 완료", "cyan")

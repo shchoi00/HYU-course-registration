@@ -27,10 +27,10 @@ We have completed the implementation of the course registration automation scrip
    source venv/bin/activate
    ```
 
-2. **Configure `config.json`**:
-   - Update `user_id` and `password`.
-   - Update `courses` list with course codes (e.g., `["COE8042"]`).
-   - Set `schedule` time if needed.
+2. **Configure credentials and runtime options**:
+   - Put `user_id` and `password` in `secrets.json`.
+   - Set `schedule` and `retry` options in `config.json` if needed.
+   - Select wishlist courses and their priority interactively after launch.
 
 3. **Run the Script**:
    ```bash
