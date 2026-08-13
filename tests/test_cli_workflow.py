@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 import questionary
 import requests
@@ -8,7 +9,10 @@ import requests
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from main import (
+    AuthenticationError,
+    attempt_registration_course,
     classify_registration_result,
+    load_authentication,
     order_courses_by_priority,
     select_target_courses,
 )
@@ -137,6 +141,46 @@ class TestTicketingRegistration(unittest.TestCase):
             ["10001", "10002", "10003"],
         )
         self.assertEqual(summary.pending, [])
+
+    def test_registration_attempt_request_error_releases_key_and_allows_next_course(self):
+        courses = [
+            {"haksuNo": "CSE1001", "suupNo": "10001", "gwamokNm": "1순위"},
+            {"haksuNo": "CSE1002", "suupNo": "10002", "gwamokNm": "2순위"},
+        ]
+        session = object()
+        tokens = {"tk": "token"}
+        released = []
+        failures = {"10001": 1}
+
+        def register(_session, _tokens, course, _key):
+            if failures.get(course["suupNo"], 0):
+                failures[course["suupNo"]] -= 1
+                raise requests.RequestException("temporary")
+            return "S", "신청 완료", {}
+
+        with patch("main.get_netfunnel_key", return_value="nf-key"), \
+                patch("main.register_course", side_effect=register), \
+                patch("main.release_netfunnel_key", side_effect=lambda _session, key: released.append(key)):
+            summary = run_ticketing(
+                courses,
+                attempt_course=lambda course, attempt: attempt_registration_course(
+                    session,
+                    tokens,
+                    course,
+                    attempt,
+                ),
+            )
+
+        self.assertEqual([course["suupNo"] for course in summary.completed], ["10001", "10002"])
+        self.assertEqual(summary.pending, [])
+        self.assertEqual(released, ["nf-key", "nf-key", "nf-key"])
+
+    def test_authentication_helper_failure_is_raised_for_top_level_retry_or_cancel(self):
+        with self.assertRaises(AuthenticationError):
+            load_authentication(
+                obtain_credentials_fn=lambda **_kwargs: (_ for _ in ()).throw(AuthenticationError("invalid")),
+                create_session_fn=lambda credentials: self.fail("validator owns session creation"),
+            )
 
 
 class TestRegistrationResultClassification(unittest.TestCase):

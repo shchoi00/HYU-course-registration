@@ -11,6 +11,20 @@ from datetime import datetime
 
 import requests
 
+from credentials import (
+    CredentialSetupCancelled,
+    CredentialStore,
+    default_credential_paths,
+    obtain_validated_credentials,
+)
+from workflow import (
+    ScheduleValidationError,
+    countdown_until,
+    parse_target_time,
+    run_scheduled_pass,
+    run_ticketing,
+)
+
 BASE_URL = "https://portal.hanyang.ac.kr/sugang"
 NF_SETTING_URL = "https://nf-setting-bucket.stclab.com/hynfad-3391.netfunnel/nf-setting.json"
 NF_GATE_URL = "https://hynfad-3391.netfunnel.stclab.com/ts.wseq"
@@ -38,21 +52,20 @@ class AuthenticationError(RuntimeError):
 
 def load_config():
     if not os.path.exists("config.json"):
-        log("config.json 파일이 없습니다. config.json.example을 참고하여 생성해주세요.", "red")
-        sys.exit(1)
+        config = {}
+    else:
+        with open("config.json", "r", encoding="utf-8") as f:
+            config = json.load(f)
 
-    with open("config.json", "r", encoding="utf-8") as f:
-        config = json.load(f)
-
-    # secrets.json 로드 (선택 사항이지만 SSO 로그인 시 필수)
     if os.path.exists("secrets.json"):
         with open("secrets.json", "r", encoding="utf-8") as f:
             secrets = json.load(f)
             config.update(secrets)
-    else:
-        if config.get("login_mode") == "sso":
-            log("SSO 로그인을 위해서는 secrets.json 파일이 필요합니다. secrets.json.example을 참고하여 생성해주세요.", "red")
-            sys.exit(1)
+        log(
+            "secrets.json 기존 인증 파일이 감지되었습니다. "
+            "저장소 마이그레이션 후 삭제를 권장합니다: secrets.json",
+            "yellow",
+        )
 
     return config
 
@@ -73,7 +86,7 @@ def create_session(config):
     session = requests.Session()
     session.headers.update(COMMON_HEADERS)
 
-    if config["login_mode"] == "cookie":
+    if config.get("login_mode") == "cookie":
         return login_with_cookie(session, config)
     else:
         return login_with_sso(session, config)
@@ -527,109 +540,337 @@ def wait_until(target_time_str):
     log("시간 도달! 수강신청을 시작합니다.", "green")
 
 
-def main():
-    config = load_config()
-    log("=== 한양대학교 수강신청 자동화 ===", "cyan")
+def prompt_credentials(questionary_module=None):
+    if questionary_module is None:
+        import questionary as questionary_module
 
-    # 1. 로그인
-    try:
-        session = create_session(config)
-    except AuthenticationError:
-        sys.exit(1)
+    user_id = questionary_module.text("포털 ID").ask()
+    if user_id is None:
+        return None
 
-    # 2. 토큰 추출
-    tokens = extract_tokens(session)
+    password = questionary_module.password("포털 비밀번호").ask()
+    if password is None:
+        return None
 
-    # 3. 희망수업 조회
-    courses = fetch_course_list(session, tokens)
+    return {
+        "login_mode": "sso",
+        "user_id": user_id.strip(),
+        "password": password,
+    }
 
-    if not courses:
-        log("희망수업이 없습니다. 포털에서 희망수업을 먼저 등록해주세요.", "red")
-        sys.exit(1)
 
-    # 4. 신청 대상 및 우선순위 선택
-    target_courses = select_target_courses(courses)
+def load_authentication(
+    obtain_credentials_fn=obtain_validated_credentials,
+    create_session_fn=create_session,
+    store=None,
+    questionary_module=None,
+    legacy_path="secrets.json",
+):
+    if store is None:
+        store = CredentialStore(default_credential_paths())
 
-    if not target_courses:
-        log("선택된 과목이 없습니다. 실행을 종료합니다.", "yellow")
-        sys.exit(1)
+    def validator(credentials):
+        candidate = {
+            "login_mode": "sso",
+            "user_id": credentials["user_id"],
+            "password": credentials["password"],
+        }
+        return create_session_fn(candidate)
 
-    log("신청 우선순위", "cyan")
-    for priority, course in enumerate(target_courses, start=1):
+    result = obtain_credentials_fn(
+        store=store,
+        prompt_credentials=lambda: prompt_credentials(questionary_module),
+        validate_credentials=validator,
+        legacy_path=legacy_path,
+    )
+    if result.migrated_legacy:
         log(
-            f"  {priority}순위: {course.get('gwamokNm', '?')} "
-            f"({course.get('haksuNo', '?')}, 수업번호 {course.get('suupNo', '?')})",
-            "cyan",
-        )
-
-    # 5. 예약 시간까지 대기
-    if config.get("schedule", {}).get("enabled"):
-        wait_until(config["schedule"]["start_time"])
-
-    # 6. 우선순위 라운드 로빈 수강신청
-    max_attempts = config.get("retry", {}).get("max_attempts", 50)
-    interval = config.get("retry", {}).get("interval_seconds", 0.5)
-
-    def attempt_course(course, attempt):
-        haksu_no = course.get("haksuNo", "?")
-        gwamok_nm = course.get("gwamokNm", "?")
-        log(f"[{attempt}/{max_attempts}] 신청 시도: {haksu_no} - {gwamok_nm}", "cyan")
-
-        nf_key = get_netfunnel_key(session)
-        if not nf_key:
-            log(f"[{attempt}/{max_attempts}] NetFunnel 키 발급 실패", "yellow")
-            return "retry"
-
-        try:
-            out_code, out_msg, _ = register_course(
-                session,
-                tokens,
-                course,
-                nf_key,
-            )
-        finally:
-            release_netfunnel_key(session, nf_key)
-
-        log(f"[{attempt}/{max_attempts}] 응답: [{out_code}] {out_msg}")
-        status = classify_registration_result(out_code, out_msg)
-
-        if status == "success":
-            if "이미" in out_msg and "신청" in out_msg:
-                log(f"이미 신청된 과목입니다: {haksu_no}", "yellow")
-            else:
-                log(f"수강신청 성공! {haksu_no} - {gwamok_nm}", "green")
-        elif out_code == "M77":
-            log("수강신청 기간이 아닙니다. 다음 라운드에서 재시도합니다.", "yellow")
-
-        return status
-
-    def log_attempt_error(course, attempt, error):
-        log(
-            f"[{attempt}/{max_attempts}] 요청 오류: "
-            f"{course.get('haksuNo', '?')} - {error}. 다음 라운드에서 재시도합니다.",
+            "secrets.json 인증 정보를 안전 저장소로 이전했습니다. "
+            "기존 파일 삭제를 권장합니다: secrets.json",
             "yellow",
         )
 
-    results = run_registration_round_robin(
-        target_courses,
-        max_attempts=max_attempts,
-        attempt_course=attempt_course,
-        wait_for_next_round=lambda: time.sleep(interval),
-        on_attempt_error=log_attempt_error,
-    )
+    credentials = {
+        "login_mode": "sso",
+        "user_id": result.credentials["user_id"],
+        "password": result.credentials["password"],
+    }
+    return credentials, result.validation
 
-    for result in results:
-        if result["status"] != "failed":
-            continue
-        course = result["course"]
+
+def select_run_mode(questionary_module=None):
+    if questionary_module is None:
+        import questionary as questionary_module
+
+    choices = [
+        questionary_module.Choice(
+            "예약 수강신청 — 지정 시각 1회 시도 후 실패 과목 취케팅",
+            value="scheduled",
+        ),
+        questionary_module.Choice(
+            "바로 취케팅 — 성공할 때까지 무제한 순회",
+            value="ticketing",
+        ),
+    ]
+    return questionary_module.select(
+        "실행 모드를 선택하세요",
+        choices=choices,
+        default="scheduled",
+    ).ask()
+
+
+def prompt_target_time(now=None, questionary_module=None):
+    if questionary_module is None:
+        import questionary as questionary_module
+    if now is None:
+        now = datetime.now()
+
+    while True:
+        answer = questionary_module.text(
+            "예약 시간을 입력하세요 (YYYY-MM-DD HH:MM:SS)"
+        ).ask()
+        if answer is None:
+            return None
+
+        try:
+            return parse_target_time(answer, now)
+        except ScheduleValidationError as error:
+            log(str(error), "yellow")
+
+
+def run_countdown(target):
+    log(f"예약 수강신청 시각: {target.strftime('%Y-%m-%d %H:%M:%S')}", "cyan")
+    countdown_until(
+        target,
+        now_fn=datetime.now,
+        sleep_fn=time.sleep,
+        render_fn=lambda remaining: log(f"남은 시간: {remaining}", "cyan"),
+    )
+    log("시간 도달! 수강신청을 시작합니다.", "green")
+
+
+def rematch_selected_courses(selected, refreshed):
+    refreshed_by_suup = {
+        str(course.get("suupNo")): course
+        for course in refreshed
+    }
+    matched = []
+    unresolved = []
+
+    for course in selected:
+        fresh_course = refreshed_by_suup.get(str(course.get("suupNo")))
+        if fresh_course is None:
+            unresolved.append(course)
+        else:
+            matched.append(fresh_course)
+
+    return matched, unresolved
+
+
+def refresh_registration_context(
+    credentials,
+    attempts=3,
+    interval=0.5,
+    create_session_fn=create_session,
+    extract_tokens_fn=extract_tokens,
+    fetch_course_list_fn=fetch_course_list,
+):
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            session = create_session_fn(credentials)
+            tokens = extract_tokens_fn(session)
+            courses = fetch_course_list_fn(session, tokens)
+            return session, tokens, courses
+        except AuthenticationError as error:
+            last_error = error
+            if attempt < attempts - 1:
+                time.sleep(interval)
+
+    raise last_error or AuthenticationError("authentication failed")
+
+
+def attempt_registration_course(
+    session,
+    tokens,
+    course,
+    attempt,
+    get_key_fn=None,
+    register_fn=None,
+    release_key_fn=None,
+):
+    if get_key_fn is None:
+        get_key_fn = get_netfunnel_key
+    if register_fn is None:
+        register_fn = register_course
+    if release_key_fn is None:
+        release_key_fn = release_netfunnel_key
+
+    haksu_no = course.get("haksuNo", "?")
+    gwamok_nm = course.get("gwamokNm", "?")
+    log(f"[{attempt}] 신청 시도: {haksu_no} - {gwamok_nm}", "cyan")
+
+    nf_key = get_key_fn(session)
+    if not nf_key:
+        log(f"[{attempt}] NetFunnel 키 발급 실패", "yellow")
+        return "retry"
+
+    try:
+        out_code, out_msg, _ = register_fn(session, tokens, course, nf_key)
+    except requests.RequestException as error:
         log(
-            f"수강신청 실패: {course.get('haksuNo', '?')} - "
-            f"{course.get('gwamokNm', '?')} ({result['attempts']}회 시도)",
-            "red",
+            f"[{attempt}] 요청 오류: {haksu_no} - {error}. 다음 라운드에서 재시도합니다.",
+            "yellow",
+        )
+        return "retry"
+    finally:
+        release_key_fn(session, nf_key)
+
+    log(f"[{attempt}] 응답: [{out_code}] {out_msg}")
+    status = classify_registration_result(out_code, out_msg)
+    if status == "success":
+        log(f"수강신청 성공: {haksu_no} - {gwamok_nm}", "green")
+    else:
+        log(f"수강신청 실패, 재시도 대기: {haksu_no} - {gwamok_nm}", "yellow")
+    return status
+
+
+def print_registration_summary(label, summary):
+    log(
+        f"{label} 완료 {len(summary.completed)}개, 대기 {len(summary.pending)}개",
+        "cyan",
+    )
+    if summary.interrupted:
+        log(f"{label} 중단됨", "yellow")
+
+
+def run_application(
+    load_authentication,
+    fetch_context,
+    select_courses,
+    select_mode,
+    select_target_time,
+    run_countdown,
+    refresh_context,
+    attempt_course,
+    wait_for_round,
+):
+    try:
+        credentials, session = load_authentication()
+    except (AuthenticationError, CredentialSetupCancelled) as error:
+        log(f"인증을 완료하지 못했습니다: {error}", "red")
+        return 1
+
+    tokens, wishlist = fetch_context(session)
+    if not wishlist:
+        log("희망수업이 없습니다. 포털에서 희망수업을 먼저 등록해주세요.", "red")
+        return 1
+
+    selected = select_courses(wishlist)
+    if not selected:
+        log("선택된 과목이 없습니다. 실행을 종료합니다.", "yellow")
+        return 1
+
+    mode = select_mode()
+    if mode is None:
+        log("실행 모드 선택이 취소되었습니다.", "yellow")
+        return 1
+    if mode not in ("scheduled", "ticketing"):
+        log("알 수 없는 실행 모드입니다.", "red")
+        return 1
+
+    if mode == "ticketing":
+        summary = run_ticketing(
+            selected,
+            attempt_course=attempt_course,
+            wait_for_next_round=wait_for_round,
+        )
+        print_registration_summary("취케팅", summary)
+        return 1 if summary.interrupted else 0
+
+    target = select_target_time()
+    if target is None:
+        log("예약 시간 입력이 취소되었습니다.", "yellow")
+        return 1
+
+    run_countdown(target)
+    try:
+        _fresh_session, _fresh_tokens, refreshed = refresh_context(credentials)
+    except AuthenticationError as error:
+        log(f"예약 직전 재인증 실패: {error}", "red")
+        return 1
+
+    scheduled_courses, unresolved = rematch_selected_courses(selected, refreshed)
+    for course in unresolved:
+        log(
+            f"새 희망수업 목록에서 찾을 수 없음: 수업번호 {course.get('suupNo', '?')}",
+            "yellow",
+        )
+    if not scheduled_courses:
+        log("새 희망수업 목록에서 신청할 과목을 찾지 못했습니다.", "red")
+        return 1
+
+    scheduled_summary = run_scheduled_pass(scheduled_courses, attempt_course)
+    print_registration_summary("예약 수강신청", scheduled_summary)
+    if scheduled_summary.interrupted:
+        return 1
+
+    if scheduled_summary.pending:
+        ticketing_summary = run_ticketing(
+            scheduled_summary.pending,
+            attempt_course=attempt_course,
+            wait_for_next_round=wait_for_round,
+        )
+        print_registration_summary("취케팅", ticketing_summary)
+        return 1 if ticketing_summary.interrupted else 0
+
+    return 0
+
+
+def main():
+    log("=== 한양대학교 수강신청 자동화 ===", "cyan")
+    auth_session = {"session": None}
+    context = {"tokens": None}
+
+    def load_auth():
+        credentials, session = load_authentication()
+        auth_session["session"] = session
+        return credentials, session
+
+    def fetch_initial_context(session):
+        tokens = extract_tokens(session)
+        courses = fetch_course_list(session, tokens)
+        context["tokens"] = tokens
+        return tokens, courses
+
+    def refresh_context(credentials):
+        session, tokens, courses = refresh_registration_context(credentials)
+        auth_session["session"] = session
+        context["tokens"] = tokens
+        return session, tokens, courses
+
+    def attempt(course, attempt_number):
+        return attempt_registration_course(
+            auth_session["session"],
+            context["tokens"],
+            course,
+            attempt_number,
         )
 
+    exit_code = run_application(
+        load_authentication=load_auth,
+        fetch_context=fetch_initial_context,
+        select_courses=select_target_courses,
+        select_mode=select_run_mode,
+        select_target_time=prompt_target_time,
+        run_countdown=run_countdown,
+        refresh_context=refresh_context,
+        attempt_course=attempt,
+        wait_for_round=lambda: time.sleep(0.5),
+    )
     log(f"\n{'='*50}", "cyan")
     log("수강신청 자동화 완료", "cyan")
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
