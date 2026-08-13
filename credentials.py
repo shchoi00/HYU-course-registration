@@ -53,7 +53,7 @@ class CredentialStore:
 
     def save(self, credentials: dict[str, str]) -> None:
         normalized = self._validate_credentials(credentials)
-        key = self._load_or_create_key()
+        key, created_key = self._load_or_create_key()
         payload = {
             "version": self.PAYLOAD_VERSION,
             "credentials": normalized,
@@ -65,15 +65,23 @@ class CredentialStore:
             separators=(",", ":"),
         ).encode("utf-8")
         token = Fernet(key).encrypt(data)
-        _atomic_write(self.paths.token_path, token)
+        try:
+            _atomic_write(self.paths.token_path, token)
+        except OSError:
+            if created_key:
+                try:
+                    self.paths.key_path.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
 
-    def _load_or_create_key(self) -> bytes:
+    def _load_or_create_key(self) -> tuple[bytes, bool]:
         if self.paths.key_path.exists():
-            return self.paths.key_path.read_bytes()
+            return self.paths.key_path.read_bytes(), False
 
         key = Fernet.generate_key()
         _atomic_write(self.paths.key_path, key)
-        return key
+        return key, True
 
     def _credentials_from_payload(self, payload):
         if not isinstance(payload, dict):

@@ -3,9 +3,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import credentials
 from credentials import CredentialPaths, CredentialStorageError, CredentialStore
 
 
@@ -42,3 +44,26 @@ class TestCredentialStore(unittest.TestCase):
 
             with self.assertRaises(CredentialStorageError):
                 store.load()
+
+    def test_first_save_token_write_failure_removes_new_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = CredentialStore(
+                CredentialPaths(
+                    root / "config" / "credential.key",
+                    root / "data" / "credentials.enc",
+                )
+            )
+            original_atomic_write = credentials._atomic_write
+
+            def fail_token_write(path, data):
+                if path == store.paths.token_path:
+                    raise OSError("token write failed")
+                original_atomic_write(path, data)
+
+            with patch("credentials._atomic_write", side_effect=fail_token_write):
+                with self.assertRaises(OSError):
+                    store.save({"user_id": "u", "password": "p"})
+
+            self.assertFalse(store.paths.key_path.exists())
+            self.assertFalse(store.paths.token_path.exists())
