@@ -32,6 +32,10 @@ AJAX_HEADERS = {
 }
 
 
+class AuthenticationError(RuntimeError):
+    pass
+
+
 def load_config():
     if not os.path.exists("config.json"):
         log("config.json 파일이 없습니다. config.json.example을 참고하여 생성해주세요.", "red")
@@ -81,7 +85,7 @@ def login_with_cookie(session, config):
     if not cookie_str:
         log("config.json의 cookie 필드를 채워주세요.", "red")
         log("브라우저 DevTools > Application > Cookies에서 복사", "yellow")
-        sys.exit(1)
+        raise AuthenticationError("cookie is required")
 
     # "key=value; key2=value2" 형식 파싱
     for pair in cookie_str.split(";"):
@@ -94,7 +98,7 @@ def login_with_cookie(session, config):
     resp = session.get(f"{BASE_URL}/sulg.do", allow_redirects=False)
     if resp.status_code == 302 or "lgins" in resp.text[:500]:
         log("쿠키가 만료되었습니다. 브라우저에서 다시 복사해주세요.", "red")
-        sys.exit(1)
+        raise AuthenticationError("cookie login failed")
 
     log("쿠키 로그인 성공", "green")
     return session
@@ -150,7 +154,7 @@ def login_with_sso(session, config):
     password = config.get("password", "")
     if not user_id or not password:
         log("config.json의 user_id와 password를 채워주세요.", "red")
-        sys.exit(1)
+        raise AuthenticationError("user_id and password are required")
 
     log("SSO 로그인 시도 중...", "cyan")
 
@@ -195,7 +199,7 @@ def login_with_sso(session, config):
     resp = session.get(f"{BASE_URL}/sulg.do", allow_redirects=False)
     if resp.status_code == 302 or "lgins" in resp.text[:500]:
         log("SSO 로그인 실패. 아이디/비밀번호를 확인해주세요.", "red")
-        sys.exit(1)
+        raise AuthenticationError("SSO login failed")
 
     log("SSO 로그인 성공", "green")
     return session
@@ -528,7 +532,10 @@ def main():
     log("=== 한양대학교 수강신청 자동화 ===", "cyan")
 
     # 1. 로그인
-    session = create_session(config)
+    try:
+        session = create_session(config)
+    except AuthenticationError:
+        sys.exit(1)
 
     # 2. 토큰 추출
     tokens = extract_tokens(session)

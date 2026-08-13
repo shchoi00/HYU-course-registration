@@ -13,10 +13,21 @@ class CredentialStorageError(Exception):
     """Raised when stored credential files are incomplete or invalid."""
 
 
+class CredentialSetupCancelled(Exception):
+    """Raised when credential onboarding is cancelled before validation succeeds."""
+
+
 @dataclass(frozen=True)
 class CredentialPaths:
     key_path: Path
     token_path: Path
+
+
+@dataclass(frozen=True)
+class ValidatedCredentials:
+    credentials: dict[str, str]
+    validation: object
+    migrated_legacy: bool
 
 
 def default_credential_paths() -> CredentialPaths:
@@ -53,7 +64,7 @@ class CredentialStore:
 
     def save(self, credentials: dict[str, str]) -> None:
         normalized = self._validate_credentials(credentials)
-        key, created_key = self._load_or_create_key()
+        key, created_key, previous_key = self._load_or_create_key()
         payload = {
             "version": self.PAYLOAD_VERSION,
             "credentials": normalized,
@@ -69,19 +80,30 @@ class CredentialStore:
             _atomic_write(self.paths.token_path, token)
         except OSError:
             if created_key:
-                try:
-                    self.paths.key_path.unlink()
-                except FileNotFoundError:
-                    pass
+                if previous_key is None:
+                    try:
+                        self.paths.key_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                else:
+                    _atomic_write(self.paths.key_path, previous_key)
             raise
 
-    def _load_or_create_key(self) -> tuple[bytes, bool]:
+    def _load_or_create_key(self) -> tuple[bytes, bool, Optional[bytes]]:
         if self.paths.key_path.exists():
-            return self.paths.key_path.read_bytes(), False
+            key = self.paths.key_path.read_bytes()
+            try:
+                Fernet(key)
+            except ValueError:
+                previous_key = key
+                key = Fernet.generate_key()
+                _atomic_write(self.paths.key_path, key)
+                return key, True, previous_key
+            return key, False, None
 
         key = Fernet.generate_key()
         _atomic_write(self.paths.key_path, key)
-        return key, True
+        return key, True, None
 
     def _credentials_from_payload(self, payload):
         if not isinstance(payload, dict):
@@ -107,6 +129,93 @@ class CredentialStore:
             raise CredentialStorageError("password is required")
 
         return {"user_id": user_id, "password": password}
+
+
+def obtain_validated_credentials(
+    store,
+    prompt_credentials,
+    validate_credentials,
+    legacy_path=None,
+) -> ValidatedCredentials:
+    try:
+        stored_credentials = store.load()
+    except CredentialStorageError:
+        stored_credentials = None
+
+    result = _validate_candidate(
+        stored_credentials,
+        validate_credentials,
+        migrated_legacy=False,
+    )
+    if result is not None:
+        return result
+
+    legacy_credentials = _load_legacy_credentials(legacy_path)
+    result = _validate_candidate(
+        legacy_credentials,
+        validate_credentials,
+        migrated_legacy=True,
+    )
+    if result is not None:
+        store.save(result.credentials)
+        return result
+
+    while True:
+        prompted_credentials = prompt_credentials()
+        if prompted_credentials is None:
+            raise CredentialSetupCancelled("credential setup was cancelled")
+
+        result = _validate_candidate(
+            prompted_credentials,
+            validate_credentials,
+            migrated_legacy=False,
+        )
+        if result is not None:
+            store.save(result.credentials)
+            return result
+
+
+def _validate_candidate(
+    credentials,
+    validate_credentials,
+    migrated_legacy: bool,
+) -> Optional[ValidatedCredentials]:
+    if credentials is None:
+        return None
+
+    try:
+        normalized = CredentialStore._validate_credentials(credentials)
+    except CredentialStorageError:
+        return None
+
+    validation = validate_credentials(normalized)
+    if not validation:
+        return None
+
+    return ValidatedCredentials(
+        credentials=normalized,
+        validation=validation,
+        migrated_legacy=migrated_legacy,
+    )
+
+
+def _load_legacy_credentials(legacy_path):
+    if legacy_path is None:
+        return None
+
+    path = Path(legacy_path)
+    if not path.exists():
+        return None
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+    try:
+        return CredentialStore._validate_credentials(payload)
+    except CredentialStorageError:
+        return None
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
