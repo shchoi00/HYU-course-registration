@@ -39,6 +39,12 @@ class TestScheduling(unittest.TestCase):
         with self.assertRaisesRegex(ScheduleValidationError, "YYYY-MM-DD HH:MM:SS"):
             parse_target_time("2026/08/13 10:00", now)
 
+    def test_parse_target_time_rejects_unpadded_value(self):
+        now = datetime(2026, 8, 3, 8, 0, 0)
+
+        with self.assertRaisesRegex(ScheduleValidationError, "YYYY-MM-DD HH:MM:SS"):
+            parse_target_time("2026-8-3 9:0:0", now)
+
     def test_format_remaining_uses_zero_padded_hours_minutes_seconds(self):
         self.assertEqual(format_remaining(3661), "01:01:01")
 

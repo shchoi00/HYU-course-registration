@@ -14,6 +14,11 @@ def parse_target_time(value: str, now: datetime) -> datetime:
             "시간은 YYYY-MM-DD HH:MM:SS 형식으로 입력해야 합니다."
         ) from exc
 
+    if target.strftime("%Y-%m-%d %H:%M:%S") != value:
+        raise ScheduleValidationError(
+            "시간은 YYYY-MM-DD HH:MM:SS 형식으로 입력해야 합니다."
+        )
+
     if target <= now:
         raise ScheduleValidationError("예약 시간은 현재보다 미래여야 합니다.")
 
