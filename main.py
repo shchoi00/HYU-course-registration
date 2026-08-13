@@ -575,7 +575,10 @@ def load_authentication(
             "user_id": credentials["user_id"],
             "password": credentials["password"],
         }
-        return create_session_fn(candidate)
+        try:
+            return create_session_fn(candidate)
+        except AuthenticationError:
+            return None
 
     result = obtain_credentials_fn(
         store=store,

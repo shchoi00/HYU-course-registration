@@ -1,6 +1,8 @@
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import questionary
@@ -8,11 +10,13 @@ import requests
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from credentials import CredentialPaths, CredentialStore
 from main import (
     AuthenticationError,
     attempt_registration_course,
     classify_registration_result,
     load_authentication,
+    run_application,
     order_courses_by_priority,
     select_target_courses,
 )
@@ -175,12 +179,84 @@ class TestTicketingRegistration(unittest.TestCase):
         self.assertEqual(summary.pending, [])
         self.assertEqual(released, ["nf-key", "nf-key", "nf-key"])
 
-    def test_authentication_helper_failure_is_raised_for_top_level_retry_or_cancel(self):
-        with self.assertRaises(AuthenticationError):
-            load_authentication(
-                obtain_credentials_fn=lambda **_kwargs: (_ for _ in ()).throw(AuthenticationError("invalid")),
-                create_session_fn=lambda credentials: self.fail("validator owns session creation"),
+    def test_invalid_prompted_credentials_retry_and_only_valid_credentials_save(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = CredentialStore(
+                CredentialPaths(
+                    root / "config" / "credential.key",
+                    root / "data" / "credentials.enc",
+                )
             )
+            prompts = FakeCredentialQuestionary([
+                ("wrong-user", "wrong-pass"),
+                ("valid-user", "valid-pass"),
+            ])
+            attempts = []
+            valid_session = object()
+
+            def create_session(credentials):
+                attempts.append(credentials)
+                if credentials["user_id"] == "wrong-user":
+                    raise AuthenticationError("invalid credentials")
+                return valid_session
+
+            credentials, session = load_authentication(
+                create_session_fn=create_session,
+                store=store,
+                questionary_module=prompts,
+                legacy_path=root / "missing-secrets.json",
+            )
+
+            self.assertEqual(credentials["user_id"], "valid-user")
+            self.assertEqual(credentials["password"], "valid-pass")
+            self.assertIs(session, valid_session)
+            self.assertEqual(store.load(), {"user_id": "valid-user", "password": "valid-pass"})
+            self.assertEqual(
+                [(attempt["user_id"], attempt["password"]) for attempt in attempts],
+                [("wrong-user", "wrong-pass"), ("valid-user", "valid-pass")],
+            )
+
+    def test_invalid_prompted_credentials_then_cancel_returns_nonzero_without_saving(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = CredentialStore(
+                CredentialPaths(
+                    root / "config" / "credential.key",
+                    root / "data" / "credentials.enc",
+                )
+            )
+            prompts = FakeCredentialQuestionary([
+                ("wrong-user", "wrong-pass"),
+                None,
+            ])
+
+            def load_auth():
+                return load_authentication(
+                    create_session_fn=lambda _credentials: (_ for _ in ()).throw(
+                        AuthenticationError("invalid credentials")
+                    ),
+                    store=store,
+                    questionary_module=prompts,
+                    legacy_path=root / "missing-secrets.json",
+                )
+
+            exit_code = run_application(
+                load_authentication=load_auth,
+                fetch_context=lambda session: self.fail("fetch must not run after cancel"),
+                select_courses=lambda wishlist: self.fail("selection must not run after cancel"),
+                select_mode=lambda: self.fail("mode prompt must not run after cancel"),
+                select_target_time=lambda: self.fail("time prompt must not run after cancel"),
+                run_countdown=lambda target: self.fail("countdown must not run after cancel"),
+                refresh_context=lambda credentials: self.fail("refresh must not run after cancel"),
+                attempt_course=lambda course, attempt: self.fail("registration must not run after cancel"),
+                wait_for_round=lambda: None,
+            )
+
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(prompts.credential_answers, [])
+            self.assertFalse(store.paths.key_path.exists())
+            self.assertFalse(store.paths.token_path.exists())
 
 
 class TestRegistrationResultClassification(unittest.TestCase):
@@ -212,6 +288,21 @@ class FakePrompt:
 
     def ask(self):
         return self.answer
+
+
+class FakeCredentialQuestionary:
+    def __init__(self, credential_answers):
+        self.credential_answers = list(credential_answers)
+        self.current = None
+
+    def text(self, _message):
+        self.current = self.credential_answers.pop(0)
+        if self.current is None:
+            return FakePrompt(None)
+        return FakePrompt(self.current[0])
+
+    def password(self, _message):
+        return FakePrompt(self.current[1])
 
 
 class FakeQuestionary:
