@@ -7,7 +7,7 @@ The automation now uses an interactive workflow with two execution modes and a v
 - **Credential onboarding with verification**: first-run `user_id` and hidden-password prompt is validated by real SSO login before any credential file is written.
 - **Legacy `secrets.json` migration**: if a legacy file exists in the repository root, it is used only after successful validation and then stored into the encrypted local store.
 - **Mode selection at launch**:
-  - `예약 수강신청` (scheduled mode) with `YYYY-MM-DD HH:MM:SS` countdown and one-attempt-per-course behavior.
+  - `예약 수강신청` (scheduled mode) with an arrow-key date/time picker, single-line countdown, and one-attempt-per-course behavior.
   - `바로 취케팅` (ticketing mode) for unlimited priority round-robin until all attempts succeed.
 - **Failure handling**:
   - Scheduled failures move directly to ticketing.
@@ -34,7 +34,8 @@ venv/bin/python -m unittest tests.test_application tests.test_cli_workflow tests
 
 - First-run failed prompt path writes no credential artifacts.
 - First-run success path writes encrypted credentials.
-- Scheduled mode validates countdown target format and runs refresh/rematch before registration attempt at target.
+- Scheduled mode starts its picker at today's `09:00:00`, rejects past selections, and runs refresh/rematch before registration at the selected target.
+- The countdown overwrites one terminal line and formats long waits with days instead of unbounded hours.
 - Ticketing and scheduled summaries are reported on interruption (`Ctrl+C`).
 - Scheduled mode transitions to ticketing immediately when pending items remain.
 
@@ -56,7 +57,7 @@ venv/bin/python -m unittest tests.test_application tests.test_cli_workflow tests
    - Login setup or reuse (first-run validated save)
    - Course selection and priorities
    - Mode choice (`예약 수강신청` / `바로 취케팅`)
-   - If scheduled, provide countdown target and wait
+   - If scheduled, choose the target with left/right and up/down arrows, press Enter, and wait
 
 ## Files
 

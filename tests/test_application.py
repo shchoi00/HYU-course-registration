@@ -1,3 +1,4 @@
+import io
 import os
 import sys
 import unittest
@@ -6,6 +7,7 @@ from unittest.mock import patch
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import main
 from main import (
     AuthenticationError,
     prompt_target_time,
@@ -75,6 +77,27 @@ class TestModeSelection(unittest.TestCase):
 
 
 class TestScheduledApplication(unittest.TestCase):
+    def test_cancelled_countdown_stops_before_refresh_or_registration(self):
+        courses = [{"suupNo": "30012"}]
+        refreshes = []
+        attempts = []
+
+        exit_code = run_application(
+            load_authentication=lambda: ({"user_id": "u", "password": "p"}, "session"),
+            fetch_context=lambda session: ({"tk": "token"}, courses),
+            select_courses=lambda wishlist: courses,
+            select_mode=lambda: "scheduled",
+            select_target_time=lambda: datetime(2026, 8, 18, 9, 0, 0),
+            run_countdown=lambda target: False,
+            refresh_context=lambda credentials: refreshes.append(credentials),
+            attempt_course=lambda session, tokens, course, attempt: attempts.append(course),
+            wait_for_round=lambda: None,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(refreshes, [])
+        self.assertEqual(attempts, [])
+
     def test_scheduled_mode_refreshes_and_uses_new_course_payload(self):
         stale = {"suupNo": "30012", "marker": "stale"}
         fresh = {"suupNo": "30012", "marker": "fresh"}
@@ -261,6 +284,71 @@ class TestRefreshContext(unittest.TestCase):
 
 
 class TestPromptTargetTime(unittest.TestCase):
+    def test_datetime_picker_applies_arrow_keys_and_accepts_with_enter(self):
+        from prompt_toolkit.input import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        now = datetime(2026, 1, 1, 8, 0, 0)
+        state = main.DateTimePickerState.for_now(now)
+
+        with create_pipe_input() as pipe_input:
+            pipe_input.send_text(
+                "\x1b[A"  # day: 1 -> 2
+                "\x1b[D"  # select month
+                "\x1b[A"  # month: January -> February
+                "\x1b[C"  # select day
+                "\x1b[C"  # select hour
+                "\x1b[A"  # hour: 09 -> 10
+                "\x1b[C"  # select minute
+                "\x1b[B"  # minute: 00 -> 59
+                "\r"
+            )
+            target = main.run_datetime_picker(
+                state,
+                now_fn=lambda: now,
+                input_stream=pipe_input,
+                output=DummyOutput(),
+            )
+
+        self.assertEqual(target, datetime(2026, 2, 2, 10, 59, 0))
+
+    def test_datetime_picker_cancels_with_escape_or_control_c(self):
+        from prompt_toolkit.input import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        now = datetime(2026, 1, 1, 8, 0, 0)
+
+        for key in ("\x1b", "\x03"):
+            with self.subTest(key=repr(key)), create_pipe_input() as pipe_input:
+                pipe_input.send_text(key)
+                target = main.run_datetime_picker(
+                    main.DateTimePickerState.for_now(now),
+                    now_fn=lambda: now,
+                    input_stream=pipe_input,
+                    output=DummyOutput(),
+                )
+
+                self.assertIsNone(target)
+
+    def test_interactive_picker_starts_today_at_nine(self):
+        now = datetime(2026, 8, 14, 23, 48, 54)
+        selected = datetime(2026, 8, 18, 9, 0, 0)
+        picker_calls = []
+
+        target = prompt_target_time(
+            now_fn=lambda: now,
+            picker_fn=lambda state, current_time: picker_calls.append(
+                (state.value, state.selected_field, current_time())
+            )
+            or selected,
+        )
+
+        self.assertEqual(target, selected)
+        self.assertEqual(
+            picker_calls,
+            [(datetime(2026, 8, 14, 9, 0, 0), "day", now)],
+        )
+
     def test_invalid_time_reprompts_without_defaulting_to_ticketing(self):
         now = datetime(2026, 8, 13, 9, 0, 0)
         prompts = FakeQuestionary(
@@ -294,6 +382,38 @@ class TestPromptTargetTime(unittest.TestCase):
 
         self.assertEqual(target, datetime(2026, 8, 13, 9, 0, 3))
         self.assertEqual(len(prompts.text_calls), 3)
+
+
+class TestCountdownDisplay(unittest.TestCase):
+    def test_countdown_updates_replace_the_same_terminal_line(self):
+        output = io.StringIO()
+
+        main.render_countdown_status("4일 10:10:39", output=output)
+        main.render_countdown_status("4일 10:10:38", output=output)
+        main.clear_countdown_status(output=output)
+
+        self.assertEqual(
+            output.getvalue(),
+            "\r\x1b[2K남은 시간: 4일 10:10:39"
+            "\r\x1b[2K남은 시간: 4일 10:10:38"
+            "\r\x1b[2K",
+        )
+
+    def test_keyboard_interrupt_cancels_countdown_without_propagating(self):
+        output = io.StringIO()
+
+        with (
+            patch("main.countdown_until", side_effect=KeyboardInterrupt),
+            patch("main.log") as log_mock,
+        ):
+            result = main.run_countdown(
+                datetime(2026, 8, 18, 9, 0, 0),
+                output=output,
+            )
+
+        self.assertFalse(result)
+        self.assertTrue(any("취소" in call.args[0] for call in log_mock.call_args_list))
+        self.assertTrue(output.getvalue().endswith("\r\x1b[2K"))
 
 
 class TestCourseRematch(unittest.TestCase):

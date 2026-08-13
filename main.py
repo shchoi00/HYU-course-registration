@@ -18,6 +18,7 @@ from credentials import (
     obtain_validated_credentials,
 )
 from workflow import (
+    DateTimePickerState,
     ScheduleValidationError,
     countdown_until,
     parse_target_time,
@@ -626,11 +627,112 @@ def select_run_mode(questionary_module=None):
     ).ask()
 
 
-def prompt_target_time(now=None, now_fn=None, questionary_module=None):
-    if questionary_module is None:
-        import questionary as questionary_module
+def render_datetime_picker(state):
+    values = (
+        f"{state.value.year:04d}",
+        f"{state.value.month:02d}",
+        f"{state.value.day:02d}",
+        f"{state.value.hour:02d}",
+        f"{state.value.minute:02d}",
+        f"{state.value.second:02d}",
+    )
+    separators = ("-", "-", "  ", ":", ":")
+    fragments = [("class:label", "예약 시각: ")]
+    for index, value in enumerate(values):
+        style = "class:selected" if index == state.selected_index else "class:value"
+        fragments.append((style, f"[{value}]"))
+        if index < len(separators):
+            fragments.append(("", separators[index]))
+    fragments.extend(
+        [
+            ("", "\n"),
+            ("class:help", "←/→ 항목 이동   ↑/↓ 값 변경   Enter 확정   Esc 취소"),
+            ("", "\n"),
+            ("class:error", state.error or ""),
+        ]
+    )
+    return fragments
+
+
+def run_datetime_picker(state, now_fn, input_stream=None, output=None):
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import Layout
+    from prompt_toolkit.layout.containers import Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.layout.dimension import Dimension
+    from prompt_toolkit.styles import Style
+
+    bindings = KeyBindings()
+
+    @bindings.add("left")
+    def move_left(event):
+        state.move(-1)
+        event.app.invalidate()
+
+    @bindings.add("right")
+    def move_right(event):
+        state.move(1)
+        event.app.invalidate()
+
+    @bindings.add("up")
+    def increase(event):
+        state.adjust(1)
+        event.app.invalidate()
+
+    @bindings.add("down")
+    def decrease(event):
+        state.adjust(-1)
+        event.app.invalidate()
+
+    @bindings.add("enter")
+    def accept(event):
+        target = state.confirm(now_fn())
+        if target is None:
+            event.app.invalidate()
+        else:
+            event.app.exit(result=target)
+
+    @bindings.add("escape")
+    @bindings.add("c-c")
+    def cancel(event):
+        event.app.exit(result=None)
+
+    control = FormattedTextControl(
+        text=lambda: render_datetime_picker(state),
+        focusable=True,
+        show_cursor=False,
+    )
+    application = Application(
+        layout=Layout(Window(control, height=Dimension.exact(3))),
+        key_bindings=bindings,
+        style=Style.from_dict(
+            {
+                "label": "bold",
+                "selected": "reverse bold ansicyan",
+                "value": "ansicyan",
+                "help": "ansibrightblack",
+                "error": "ansired bold",
+            }
+        ),
+        full_screen=False,
+        erase_when_done=True,
+        input=input_stream,
+        output=output,
+    )
+    return application.run()
+
+
+def prompt_target_time(now=None, now_fn=None, questionary_module=None, picker_fn=None):
     if now_fn is None:
         now_fn = datetime.now if now is None else lambda: now
+
+    if picker_fn is not None:
+        return picker_fn(DateTimePickerState.for_now(now_fn()), now_fn)
+    if questionary_module is None and sys.stdin.isatty() and sys.stdout.isatty():
+        return run_datetime_picker(DateTimePickerState.for_now(now_fn()), now_fn)
+    if questionary_module is None:
+        import questionary as questionary_module
 
     while True:
         answer = questionary_module.text(
@@ -645,15 +747,36 @@ def prompt_target_time(now=None, now_fn=None, questionary_module=None):
             log(str(error), "yellow")
 
 
-def run_countdown(target):
+def render_countdown_status(remaining, output=None):
+    if output is None:
+        output = sys.stdout
+    output.write(f"\r\033[2K남은 시간: {remaining}")
+    output.flush()
+
+
+def clear_countdown_status(output=None):
+    if output is None:
+        output = sys.stdout
+    output.write("\r\033[2K")
+    output.flush()
+
+
+def run_countdown(target, output=None):
     log(f"예약 수강신청 시각: {target.strftime('%Y-%m-%d %H:%M:%S')}", "cyan")
-    countdown_until(
-        target,
-        now_fn=datetime.now,
-        sleep_fn=time.sleep,
-        render_fn=lambda remaining: log(f"남은 시간: {remaining}", "cyan"),
-    )
+    try:
+        countdown_until(
+            target,
+            now_fn=datetime.now,
+            sleep_fn=time.sleep,
+            render_fn=lambda remaining: render_countdown_status(remaining, output),
+        )
+    except KeyboardInterrupt:
+        clear_countdown_status(output)
+        log("예약 대기가 취소되었습니다.", "yellow")
+        return False
+    clear_countdown_status(output)
     log("시간 도달! 수강신청을 시작합니다.", "green")
+    return True
 
 
 def rematch_selected_courses(selected, refreshed):
@@ -803,7 +926,8 @@ def run_application(
         log("예약 시간 입력이 취소되었습니다.", "yellow")
         return 1
 
-    run_countdown(target)
+    if run_countdown(target) is False:
+        return 1
     try:
         fresh_session, fresh_tokens, refreshed = refresh_context(credentials)
     except AuthenticationError as error:
