@@ -70,7 +70,7 @@ Empty selections and cancelled prompts terminate without sending registration re
 
 ## Error Handling
 
-- Authentication failure during first setup: show failure, save nothing, and allow another run.
+- Authentication failure during first setup: show failure, save nothing, and return to the credential prompt in the current process.
 - Stored credential corruption: report and return to setup; preserve corrupt files until replacement credentials pass login validation.
 - Session refresh failure at scheduled time: retry login up to three times at 0.5-second intervals while preserving the selected course list. If all three fail, report that no registration request was sent and exit nonzero; `Ctrl+C` remains available.
 - Wishlist refresh mismatch: report the exact course name, code, and class number; skip malformed registration data.
