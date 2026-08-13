@@ -1,12 +1,1 @@
-{
-  "login_mode": "sso",
-  "cookie": "",
-  "schedule": {
-    "enabled": false,
-    "start_time": "2026-02-19 10:00:00"
-  },
-  "retry": {
-    "max_attempts": 10,
-    "interval_seconds": 0.3
-  }
-}
+{}

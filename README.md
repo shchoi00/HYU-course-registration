@@ -8,9 +8,9 @@
 - **NetFunnel 우회**: 대기열 티켓을 자동으로 발급받고 활성화합니다 (Opcode 5001 -> 5002).
 - **희망수업 자동 조회**: 포털에 등록한 희망수업을 실행 시 자동으로 불러옵니다.
 - **대화형 과목 선택**: 터미널 체크박스로 신청 과목과 우선순위를 선택합니다.
-- **우선순위 순회**: 매 라운드마다 1순위부터 각 과목을 한 번씩 신청합니다.
-- **스케줄링**: 수강신청 시작 시간까지 대기하다가 정시에 실행됩니다.
-- **자동 재시도**: 신청 실패 시 설정된 간격으로 자동으로 재시도합니다.
+- **예약 수강신청**: 시작 시각( `YYYY-MM-DD HH:MM:SS`)을 입력한 뒤 정확히 한 번씩 신청을 시도한 뒤 실패 과목만 남겨둡니다.
+- **바로 취케팅**: 실패 과목이 없어질 때까지 무제한 라운드로 순회 신청합니다.
+- **자동 재시도**: NetFunnel/수강신청 오류를 교차 재시도하며 실패한 과목만 다음 라운드에 남깁니다.
 
 ## 사전 요구 사항 (Prerequisites)
 
@@ -19,78 +19,65 @@
 
 ## 설치 방법 (Installation)
 
-1. 저장소를 클론합니다:
+아래 두 줄만 실행합니다:
 
-   ```bash
-   git clone -
-   cd hanyang-sugang-macro
-   ```
+```bash
+venv/bin/pip install -r requirements.txt
+venv/bin/python main.py
+```
 
-2. 가상 환경을 생성하고 활성화합니다:
+## 실행 및 초기 설정 (Setup & First Run)
 
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # Mac/Linux
-   # venv\Scripts\activate  # Windows
-   ```
+1. **첫 실행 자격 증명 등록**
 
-3. 필요한 라이브러리를 설치합니다:
-   ```bash
-   pip install -r requirements.txt
-   ```
+`main.py`를 첫 실행하면 자격 증명을 입력받고 즉시 SSO 로그인으로 검증한 뒤, 검증에 성공해야만 로컬 저장합니다.
 
-## 설정 (Configuration)
+```text
+포털 ID: 입력
+포털 비밀번호: 비밀번호는 입력 시 화면에 표시되지 않습니다.
+```
 
-1. **계정 설정 (Secrets Setup)**:
-   `secrets.json.example` 파일을 `secrets.json`으로 복사한 후, 포털 ID와 비밀번호를 입력하세요.
+로그인 실패 시에는 어떤 파일도 쓰지 않습니다. 로그인 성공 시 `credentials.enc`가 생성되고, 다음 실행부터는 로그인 없이 자동 재사용합니다.
 
-   ```bash
-   cp secrets.json.example secrets.json
-   ```
+2. **기존 파일 마이그레이션**
 
-   ```json
-   {
-     "user_id": "your_id",
-     "password": "your_password"
-   }
-   ```
-
-   _주의: `secrets.json` 파일은 개인 정보를 포함하고 있으므로 git에 커밋되지 않도록 `.gitignore`에 포함되어 있습니다._
-
-2. **실행 설정 (Runtime Setup)**:
-   `config.json.example` 파일을 `config.json`으로 복사한 후, 예약 시간과 재시도 정책을 설정하세요. 신청 과목은 파일에 입력하지 않습니다.
-   ```bash
-   cp config.json.example config.json
-   ```
-   ```json
-   {
-     "login_mode": "sso",
-     "schedule": {
-       "enabled": true,
-       "start_time": "2026-02-10 10:00:00"
-     },
-     "retry": {
-       "max_attempts": 50,
-       "interval_seconds": 0.3
-     }
-   }
-   ```
+루트의 `secrets.json`이 남아 있으면(이전 버전에서 사용하던 방식), 자동으로 인증을 시도 후 성공 시 로컬 안전 저장소로 이전합니다.
+이동이 완료되면 수동으로 `secrets.json` 삭제를 권장합니다.
 
 ## 사용 방법 (Usage)
 
-스크립트를 실행합니다:
+항상 다음 명령으로 실행합니다:
 
 ```bash
-python main.py
+venv/bin/python main.py
 ```
 
-실행하면 다음 순서로 진행됩니다:
+실행 흐름:
 
-1. `secrets.json`의 포털 계정으로 로그인합니다.
-2. 포털의 희망수업 목록을 자동으로 불러옵니다.
-3. `Space`로 신청할 과목을 선택하고 `Enter`를 누릅니다.
-4. 선택한 과목의 1순위, 2순위 순서를 지정합니다.
-5. 각 라운드에서 우선순위 순으로 과목별 한 번씩 신청합니다. 성공한 과목은 다음 라운드에서 제외됩니다.
+1. 저장된 자격 증명 자동 로드(있으면) 또는 ID/비밀번호 입력 및 첫 실행 검증.
+2. 포털 희망수업 조회.
+3. 신청 과목 다중선택 및 우선순위 지정.
+4. 실행 모드 선택:
+   - `예약 수강신청`(기본값): 수강신청 시각을 `YYYY-MM-DD HH:MM:SS` 형식으로 입력.
+     - 대상 시각까지 카운트다운(`HH:MM:SS`) 표시.
+     - 도달 시 과목별 1회씩만 시도.
+     - 실패한 과목만 추려 즉시 `바로 취케팅`으로 전환.
+   - `바로 취케팅`: 실패 과목이 없어질 때까지 우선순위 라운드로 무제한 반복.
+5. `Ctrl+C`로 중단하면 완료/대기 상태 요약을 즉시 출력하고 종료합니다.
+
+## 보안 주의 (Security)
+
+저장된 비밀번호는 Fernet으로 암호화되어 `credentials.enc`에 저장되며, 변조 시 복호화 검증 실패로 즉시 차단됩니다.
+단, 공격자가 `credential.key`와 `credentials.enc` 두 파일 모두 탈취하면 복호화가 가능하므로, 두 파일 모두 동일 기기/계정의 권한 경계 내에서 보호해야 합니다.
+
+저장 위치는 플랫폼별로 달라지며 `platformdirs`가 다음 규칙으로 계산합니다.
+- 키: `platformdirs.user_config_path("hyu-course-registration", appauthor=False) / "credential.key"`
+- 토큰: `platformdirs.user_data_path("hyu-course-registration", appauthor=False) / "credentials.enc"`
+
+예시:
+- Linux: `~/.config/hyu-course-registration/credential.key`, `~/.local/share/hyu-course-registration/credentials.enc`
+- macOS: `~/Library/Application Support/hyu-course-registration/credential.key`, `~/Library/Application Support/hyu-course-registration/credentials.enc`
+- Windows: `%APPDATA%`/`%LOCALAPPDATA%` 기반 `platformdirs` 표준 경로
 
 ## 면책 조항 (Disclaimer)
 

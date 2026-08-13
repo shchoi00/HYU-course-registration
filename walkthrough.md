@@ -2,43 +2,67 @@
 
 ## Implementation Summary
 
-We have completed the implementation of the course registration automation script. The key technical challenge was the NetFunnel integration, which required a specific opcode sequence (5001 -> 5002) to acquire and activate a valid ticket.
+The automation now uses an interactive workflow with two execution modes and a validated credential migration path:
+
+- **Credential onboarding with verification**: first-run `user_id` and hidden-password prompt is validated by real SSO login before any credential file is written.
+- **Legacy `secrets.json` migration**: if a legacy file exists in the repository root, it is used only after successful validation and then stored into the encrypted local store.
+- **Mode selection at launch**:
+  - `예약 수강신청` (scheduled mode) with `YYYY-MM-DD HH:MM:SS` countdown and one-attempt-per-course behavior.
+  - `바로 취케팅` (ticketing mode) for unlimited priority round-robin until all attempts succeed.
+- **Failure handling**:
+  - Scheduled failures move directly to ticketing.
+  - Ticketing retries only failed courses in each round; successful courses are removed from later rounds.
+  - `Ctrl+C` returns a completion/pending summary state.
 
 ## Architecture
 
-- **Login**: Supports SSO login using RSA encryption (PKCS#1 v1.5) to `lgnps.do`.
-- **Search**: Fetches course information using `findHeemangSuupSearchs.do`.
-- **Queue**: Uses NetFunnel API to get a ticket (`opcode=5001`) and activate it (`opcode=5002`).
-- **Registration**: Submits `hyuHaksaengSgsc.do` with the activated NetFunnel key and browser-mimicking headers (`sec-ch-ua`, etc.).
+- **Login**: Uses RSA-encrypted SSO login flow (`publicTk.do` + `lgnps.do`) and verifies via portal access.
+- **Course discovery**: Loads wishlist entries from `/findHeemangSuupSearchs.do`.
+- **Queueing**: NetFunnel handshake `5001 -> 5002` for each registration attempt.
+- **Registration**: Sends `hyuHaksaengSgsc.do` with activated NetFunnel key.
 
-## Verification Results
+## Current CLI Verification Flow
 
-- **Login**: ✅ Successful (RSS public key retrieval -> Encrypted Login -> Session established)
-- **Token Extraction**: ✅ Extracted `tk` token from `sulg.do`.
-- **Course Search**: ✅ Successfully retrieved course list (e.g., COE8042).
-- **NetFunnel**: ✅ Successfully acquired and Activated key `54C26E85...`.
-- **Registration**: ✅ Server responded with `[M77] 수강신청 기간이 아닙니다.`, confirming the request format and headers are correct and reached the business logic.
+### Local verification commands
 
-## How to Use
+```bash
+venv/bin/python -m unittest tests.test_credentials tests.test_workflow -v
+venv/bin/python -m unittest tests.test_application tests.test_cli_workflow tests.test_course_selection -v
+```
 
-1. **Activate Virtual Environment**:
+### Operational behavior assertions covered by tests
+
+- First-run failed prompt path writes no credential artifacts.
+- First-run success path writes encrypted credentials.
+- Scheduled mode validates countdown target format and runs refresh/rematch before registration attempt at target.
+- Ticketing and scheduled summaries are reported on interruption (`Ctrl+C`).
+- Scheduled mode transitions to ticketing immediately when pending items remain.
+
+## Usage
+
+1. Install dependencies in virtualenv:
 
    ```bash
-   source venv/bin/activate
+   venv/bin/pip install -r requirements.txt
    ```
 
-2. **Configure credentials and runtime options**:
-   - Put `user_id` and `password` in `secrets.json`.
-   - Set `schedule` and `retry` options in `config.json` if needed.
-   - Select wishlist courses and their priority interactively after launch.
+2. Run the CLI:
 
-3. **Run the Script**:
    ```bash
-   python main.py
+   venv/bin/python main.py
    ```
+
+3. Follow the interactive sequence:
+   - Login setup or reuse (first-run validated save)
+   - Course selection and priorities
+   - Mode choice (`예약 수강신청` / `바로 취케팅`)
+   - If scheduled, provide countdown target and wait
 
 ## Files
 
-- `main.py`: Main automation script.
-- `config.json`: User configuration.
-- `.gitignore`: Excludes sensitive files and venv.
+- `main.py`: Application orchestration and registration workflow.
+- `credentials.py`: Encrypted credential store/migration helpers using `platformdirs`.
+- `workflow.py`: Scheduled countdown and round-robin orchestration.
+- `config.json`: Optional compatibility file (normal run path does not require manual editing).
+- `secrets.json`: Legacy migration input only.
+- `.gitignore`: Excludes legacy local files such as `secrets.json`.
