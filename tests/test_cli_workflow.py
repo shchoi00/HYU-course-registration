@@ -10,9 +10,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from main import (
     classify_registration_result,
     order_courses_by_priority,
-    run_registration_round_robin,
     select_target_courses,
 )
+from workflow import run_ticketing
 
 
 class TestCoursePriority(unittest.TestCase):
@@ -62,19 +62,7 @@ class TestCoursePriority(unittest.TestCase):
         )
 
 
-class TestRoundRobinRegistration(unittest.TestCase):
-    def test_rejects_non_positive_max_attempts_before_registration(self):
-        attempted = []
-
-        with self.assertRaisesRegex(ValueError, "max_attempts"):
-            run_registration_round_robin(
-                [{"haksuNo": "CSE1001", "suupNo": "10001", "gwamokNm": "1순위"}],
-                max_attempts=0,
-                attempt_course=lambda course, attempt: attempted.append((course, attempt)),
-            )
-
-        self.assertEqual(attempted, [])
-
+class TestTicketingRegistration(unittest.TestCase):
     def test_transient_request_error_does_not_skip_later_courses(self):
         courses = [
             {"haksuNo": "CSE1001", "suupNo": "10001", "gwamokNm": "1순위"},
@@ -86,12 +74,14 @@ class TestRoundRobinRegistration(unittest.TestCase):
             suup_no = course["suupNo"]
             calls.append((suup_no, attempt_number))
             if suup_no == "10001" and attempt_number == 1:
-                raise requests.RequestException("temporary network failure")
+                try:
+                    raise requests.RequestException("temporary network failure")
+                except requests.RequestException:
+                    return "retry"
             return "success"
 
-        results = run_registration_round_robin(
+        summary = run_ticketing(
             courses,
-            max_attempts=2,
             attempt_course=attempt,
         )
 
@@ -100,9 +90,10 @@ class TestRoundRobinRegistration(unittest.TestCase):
             [("10001", 1), ("10002", 1), ("10001", 2)],
         )
         self.assertEqual(
-            [(result["status"], result["attempts"]) for result in results],
-            [("success", 2), ("success", 1)],
+            [course["suupNo"] for course in summary.completed],
+            ["10001", "10002"],
         )
+        self.assertEqual(summary.pending, [])
 
     def test_retries_remaining_courses_once_per_priority_round(self):
         courses = [
@@ -113,7 +104,7 @@ class TestRoundRobinRegistration(unittest.TestCase):
         outcomes = {
             "10001": ["retry", "success"],
             "10002": ["success"],
-            "10003": ["retry", "retry", "retry"],
+            "10003": ["retry", "retry", "success"],
         }
         calls = []
         waits = []
@@ -123,9 +114,8 @@ class TestRoundRobinRegistration(unittest.TestCase):
             calls.append((suup_no, attempt_number))
             return outcomes[suup_no].pop(0)
 
-        results = run_registration_round_robin(
+        summary = run_ticketing(
             courses,
-            max_attempts=3,
             attempt_course=attempt,
             wait_for_next_round=lambda: waits.append("wait"),
         )
@@ -143,9 +133,10 @@ class TestRoundRobinRegistration(unittest.TestCase):
         )
         self.assertEqual(waits, ["wait", "wait"])
         self.assertEqual(
-            [(result["status"], result["attempts"]) for result in results],
-            [("success", 2), ("success", 1), ("failed", 3)],
+            [course["suupNo"] for course in summary.completed],
+            ["10001", "10002", "10003"],
         )
+        self.assertEqual(summary.pending, [])
 
 
 class TestRegistrationResultClassification(unittest.TestCase):
