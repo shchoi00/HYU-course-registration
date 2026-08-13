@@ -138,10 +138,13 @@ def obtain_validated_credentials(
     prompt_credentials,
     validate_credentials,
     legacy_path=None,
+    on_storage_error=None,
 ) -> ValidatedCredentials:
     try:
         stored_credentials = store.load()
-    except CredentialStorageError:
+    except CredentialStorageError as error:
+        if on_storage_error is not None:
+            on_storage_error(error)
         stored_credentials = None
 
     result = _validate_candidate(

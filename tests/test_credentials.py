@@ -14,11 +14,27 @@ from credentials import (
     CredentialSetupCancelled,
     CredentialStorageError,
     CredentialStore,
+    default_credential_paths,
     obtain_validated_credentials,
 )
 
 
 class TestCredentialStore(unittest.TestCase):
+    def test_default_credential_paths_use_platform_config_and_data_directories(self):
+        class FakePlatformDirs:
+            user_config_path = "/tmp/hyu-config"
+            user_data_path = "/tmp/hyu-data"
+
+            def __init__(self, appname, appauthor):
+                self.appname = appname
+                self.appauthor = appauthor
+
+        with patch("credentials.PlatformDirs", FakePlatformDirs):
+            paths = default_credential_paths()
+
+        self.assertEqual(paths.key_path, Path("/tmp/hyu-config") / "credential.key")
+        self.assertEqual(paths.token_path, Path("/tmp/hyu-data") / "credentials.enc")
+
     def test_round_trip_encrypts_without_plaintext(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -187,6 +203,31 @@ class TestCredentialOnboarding(unittest.TestCase):
             self.assertEqual(store.paths.key_path.read_bytes(), original_key)
             self.assertEqual(store.paths.token_path.read_bytes(), original_token)
 
+    def test_corrupt_store_reports_error_and_preserves_files_when_cancelled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = self.make_store(root)
+            store.paths.key_path.parent.mkdir(parents=True)
+            store.paths.token_path.parent.mkdir(parents=True)
+            store.paths.key_path.write_text("not-a-fernet-key", encoding="utf-8")
+            store.paths.token_path.write_text("not-a-token", encoding="utf-8")
+            original_key = store.paths.key_path.read_bytes()
+            original_token = store.paths.token_path.read_bytes()
+            errors = []
+
+            with self.assertRaises(CredentialSetupCancelled):
+                obtain_validated_credentials(
+                    store,
+                    prompt_credentials=lambda: None,
+                    validate_credentials=lambda value: object(),
+                    on_storage_error=errors.append,
+                )
+
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], CredentialStorageError)
+            self.assertEqual(store.paths.key_path.read_bytes(), original_key)
+            self.assertEqual(store.paths.token_path.read_bytes(), original_token)
+
     def test_corrupt_store_is_replaced_after_prompted_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -253,3 +294,27 @@ class TestCredentialOnboarding(unittest.TestCase):
             self.assertIs(result.validation, session)
             self.assertFalse(result.migrated_legacy)
             self.assertEqual(store.load()["user_id"], "prompted")
+
+    def test_load_authentication_logs_storage_error_warning(self):
+        from main import load_authentication
+
+        logs = []
+
+        def fake_obtain_credentials(**kwargs):
+            kwargs["on_storage_error"](CredentialStorageError("stored credentials are invalid"))
+            raise CredentialSetupCancelled("cancelled")
+
+        with (
+            patch("main.log", side_effect=lambda message, color=None: logs.append((message, color))),
+            self.assertRaises(CredentialSetupCancelled),
+        ):
+            load_authentication(
+                obtain_credentials_fn=fake_obtain_credentials,
+                store=object(),
+                legacy_path=None,
+            )
+
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0][1], "yellow")
+        self.assertIn("저장된 인증 정보를 읽을 수 없습니다", logs[0][0])
+        self.assertIn("stored credentials are invalid", logs[0][0])

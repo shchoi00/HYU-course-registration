@@ -585,6 +585,10 @@ def load_authentication(
         prompt_credentials=lambda: prompt_credentials(questionary_module),
         validate_credentials=validator,
         legacy_path=legacy_path,
+        on_storage_error=lambda error: log(
+            f"저장된 인증 정보를 읽을 수 없습니다. 새 인증 정보를 입력합니다: {error}",
+            "yellow",
+        ),
     )
     if result.migrated_legacy:
         log(
@@ -622,11 +626,11 @@ def select_run_mode(questionary_module=None):
     ).ask()
 
 
-def prompt_target_time(now=None, questionary_module=None):
+def prompt_target_time(now=None, now_fn=None, questionary_module=None):
     if questionary_module is None:
         import questionary as questionary_module
-    if now is None:
-        now = datetime.now()
+    if now_fn is None:
+        now_fn = datetime.now if now is None else lambda: now
 
     while True:
         answer = questionary_module.text(
@@ -636,7 +640,7 @@ def prompt_target_time(now=None, questionary_module=None):
             return None
 
         try:
-            return parse_target_time(answer, now)
+            return parse_target_time(answer, now_fn())
         except ScheduleValidationError as error:
             log(str(error), "yellow")
 
@@ -764,7 +768,7 @@ def run_application(
         log(f"인증을 완료하지 못했습니다: {error}", "red")
         return 1
 
-    _tokens, wishlist = fetch_context(session)
+    tokens, wishlist = fetch_context(session)
     if not wishlist:
         log("희망수업이 없습니다. 포털에서 희망수업을 먼저 등록해주세요.", "red")
         return 1
@@ -783,9 +787,12 @@ def run_application(
         return 1
 
     if mode == "ticketing":
+        def attempt_with_initial_context(course, attempt_number):
+            return attempt_course(session, tokens, course, attempt_number)
+
         summary = run_ticketing(
             selected,
-            attempt_course=attempt_course,
+            attempt_course=attempt_with_initial_context,
             wait_for_next_round=wait_for_round,
         )
         print_registration_summary("취케팅", summary)
@@ -798,7 +805,7 @@ def run_application(
 
     run_countdown(target)
     try:
-        _fresh_session, _fresh_tokens, refreshed = refresh_context(credentials)
+        fresh_session, fresh_tokens, refreshed = refresh_context(credentials)
     except AuthenticationError as error:
         log(f"예약 직전 재인증 실패: {error}", "red")
         return 1
@@ -813,7 +820,10 @@ def run_application(
         log("새 희망수업 목록에서 신청할 과목을 찾지 못했습니다.", "red")
         return 1
 
-    scheduled_summary = run_scheduled_pass(scheduled_courses, attempt_course)
+    def attempt_with_fresh_context(course, attempt_number):
+        return attempt_course(fresh_session, fresh_tokens, course, attempt_number)
+
+    scheduled_summary = run_scheduled_pass(scheduled_courses, attempt_with_fresh_context)
     print_registration_summary("예약 수강신청", scheduled_summary)
     if scheduled_summary.interrupted:
         return 1
@@ -821,53 +831,48 @@ def run_application(
     if scheduled_summary.pending:
         ticketing_summary = run_ticketing(
             scheduled_summary.pending,
-            attempt_course=attempt_course,
+            attempt_course=attempt_with_fresh_context,
             wait_for_next_round=wait_for_round,
         )
         print_registration_summary("취케팅", ticketing_summary)
-        return 1 if ticketing_summary.interrupted else 0
+        if ticketing_summary.interrupted:
+            return 1
+        if unresolved:
+            log(f"새 희망수업 목록에서 찾지 못한 과목 {len(unresolved)}개가 남았습니다.", "yellow")
+            return 1
+        return 0
+
+    if unresolved:
+        log(f"새 희망수업 목록에서 찾지 못한 과목 {len(unresolved)}개가 남았습니다.", "yellow")
+        return 1
 
     return 0
 
 
 def main():
     log("=== 한양대학교 수강신청 자동화 ===", "cyan")
-    auth_session = {"session": None}
-    context = {"tokens": None}
-
-    def load_auth():
-        credentials, session = load_authentication()
-        auth_session["session"] = session
-        return credentials, session
 
     def fetch_initial_context(session):
         tokens = extract_tokens(session)
         courses = fetch_course_list(session, tokens)
-        context["tokens"] = tokens
         return tokens, courses
 
-    def refresh_context(credentials):
-        session, tokens, courses = refresh_registration_context(credentials)
-        auth_session["session"] = session
-        context["tokens"] = tokens
-        return session, tokens, courses
-
-    def attempt(course, attempt_number):
+    def attempt(session, tokens, course, attempt_number):
         return attempt_registration_course(
-            auth_session["session"],
-            context["tokens"],
+            session,
+            tokens,
             course,
             attempt_number,
         )
 
     exit_code = run_application(
-        load_authentication=load_auth,
+        load_authentication=load_authentication,
         fetch_context=fetch_initial_context,
         select_courses=select_target_courses,
         select_mode=select_run_mode,
         select_target_time=prompt_target_time,
         run_countdown=run_countdown,
-        refresh_context=refresh_context,
+        refresh_context=refresh_registration_context,
         attempt_course=attempt,
         wait_for_round=lambda: time.sleep(0.5),
     )

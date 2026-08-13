@@ -36,6 +36,12 @@ class TestScheduling(unittest.TestCase):
         with self.assertRaisesRegex(ScheduleValidationError, "미래"):
             parse_target_time("2026-08-13 08:59:59", now)
 
+    def test_parse_target_time_rejects_value_equal_to_now(self):
+        now = datetime(2026, 8, 13, 9, 0, 0)
+
+        with self.assertRaisesRegex(ScheduleValidationError, "미래"):
+            parse_target_time("2026-08-13 09:00:00", now)
+
     def test_parse_target_time_rejects_malformed_value(self):
         now = datetime(2026, 8, 13, 9, 0, 0)
 
@@ -64,6 +70,20 @@ class TestScheduling(unittest.TestCase):
 
         self.assertEqual(rendered, ["00:00:02", "00:00:01", "00:00:00"])
         self.assertEqual(clock.sleeps, [1, 1])
+
+    def test_countdown_renders_fractional_remaining_second_without_oversleeping(self):
+        clock = FakeClock(datetime(2026, 8, 13, 9, 59, 59, 600000))
+        rendered = []
+
+        countdown_until(
+            datetime(2026, 8, 13, 10, 0, 0),
+            now_fn=clock.now,
+            sleep_fn=clock.sleep,
+            render_fn=rendered.append,
+        )
+
+        self.assertEqual(rendered, ["00:00:01", "00:00:00"])
+        self.assertEqual(clock.sleeps, [0.4])
 
 
 class TestWorkflowModes(unittest.TestCase):

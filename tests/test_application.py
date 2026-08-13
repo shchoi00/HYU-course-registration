@@ -2,6 +2,7 @@ import os
 import sys
 import unittest
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -65,7 +66,7 @@ class TestModeSelection(unittest.TestCase):
             select_target_time=lambda: self.fail("time prompt must not run"),
             run_countdown=lambda target: self.fail("countdown must not run"),
             refresh_context=lambda credentials: self.fail("refresh must not run"),
-            attempt_course=lambda course, attempt: attempts.append((course, attempt)),
+            attempt_course=lambda session, tokens, course, attempt: attempts.append((course, attempt)),
             wait_for_round=lambda: None,
         )
 
@@ -88,7 +89,7 @@ class TestScheduledApplication(unittest.TestCase):
             select_target_time=lambda: target,
             run_countdown=lambda selected_target: None,
             refresh_context=lambda credentials: ("fresh-session", {"tk": "new"}, [fresh]),
-            attempt_course=lambda course, attempt: attempted.append((course, attempt)) or "success",
+            attempt_course=lambda session, tokens, course, attempt: attempted.append((course, attempt)) or "success",
             wait_for_round=lambda: None,
         )
 
@@ -113,7 +114,7 @@ class TestScheduledApplication(unittest.TestCase):
             select_target_time=lambda: datetime(2026, 8, 13, 10, 0, 0),
             run_countdown=lambda target: None,
             refresh_context=lambda credentials: ("fresh-session", {"tk": "new"}, courses),
-            attempt_course=lambda course, attempt: attempts.append((course["suupNo"], attempt))
+            attempt_course=lambda session, tokens, course, attempt: attempts.append((course["suupNo"], attempt))
             or outcomes[course["suupNo"]].pop(0),
             wait_for_round=lambda: waits.append("wait"),
         )
@@ -138,12 +139,86 @@ class TestScheduledApplication(unittest.TestCase):
             select_target_time=lambda: datetime(2026, 8, 13, 10, 0, 0),
             run_countdown=lambda target: None,
             refresh_context=lambda credentials: ("fresh-session", {"tk": "new"}, [fresh_other]),
-            attempt_course=lambda course, attempt: attempts.append((course, attempt)),
+            attempt_course=lambda session, tokens, course, attempt: attempts.append((course, attempt)),
             wait_for_round=lambda: None,
         )
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(attempts, [])
+
+    def test_partial_refresh_rematch_attempts_only_fresh_courses_and_returns_nonzero(self):
+        stale_missing = {"suupNo": "30012", "marker": "stale-missing"}
+        stale_matched = {"suupNo": "30013", "marker": "stale-matched"}
+        fresh_matched = {"suupNo": "30013", "marker": "fresh-matched"}
+        attempts = []
+        logs = []
+
+        with patch("main.log", side_effect=lambda message, color=None: logs.append(message)):
+            exit_code = run_application(
+                load_authentication=lambda: ({"user_id": "u", "password": "p"}, "initial-session"),
+                fetch_context=lambda session: ({"tk": "old"}, [stale_missing, stale_matched]),
+                select_courses=lambda wishlist: [stale_missing, stale_matched],
+                select_mode=lambda: "scheduled",
+                select_target_time=lambda: datetime(2026, 8, 13, 10, 0, 0),
+                run_countdown=lambda target: None,
+                refresh_context=lambda credentials: ("fresh-session", {"tk": "new"}, [fresh_matched]),
+                attempt_course=lambda session, tokens, course, attempt: attempts.append((course, attempt)) or "success",
+                wait_for_round=lambda: None,
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(attempts, [(fresh_matched, 1)])
+        self.assertTrue(any("30012" in message for message in logs))
+
+    def test_direct_ticketing_attempts_with_initial_auth_context(self):
+        courses = [{"suupNo": "30012"}]
+        attempts = []
+
+        exit_code = run_application(
+            load_authentication=lambda: ({"user_id": "u", "password": "p"}, "initial-session"),
+            fetch_context=lambda session: ({"tk": "initial-token"}, courses),
+            select_courses=lambda wishlist: courses,
+            select_mode=lambda: "ticketing",
+            select_target_time=lambda: self.fail("time prompt must not run"),
+            run_countdown=lambda target: self.fail("countdown must not run"),
+            refresh_context=lambda credentials: self.fail("refresh must not run"),
+            attempt_course=lambda session, tokens, course, attempt: attempts.append(
+                (session, tokens, course, attempt)
+            ) or "success",
+            wait_for_round=lambda: None,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(attempts, [("initial-session", {"tk": "initial-token"}, courses[0], 1)])
+
+    def test_scheduled_and_ticketing_handoff_attempt_with_refreshed_auth_context(self):
+        courses = [{"suupNo": "1"}, {"suupNo": "2"}]
+        outcomes = {"1": ["retry", "success"], "2": ["success"]}
+        attempts = []
+
+        exit_code = run_application(
+            load_authentication=lambda: ({"user_id": "u", "password": "p"}, "initial-session"),
+            fetch_context=lambda session: ({"tk": "initial-token"}, courses),
+            select_courses=lambda wishlist: courses,
+            select_mode=lambda: "scheduled",
+            select_target_time=lambda: datetime(2026, 8, 13, 10, 0, 0),
+            run_countdown=lambda target: None,
+            refresh_context=lambda credentials: ("fresh-session", {"tk": "fresh-token"}, courses),
+            attempt_course=lambda session, tokens, course, attempt: attempts.append(
+                (session, tokens, course["suupNo"], attempt)
+            ) or outcomes[course["suupNo"]].pop(0),
+            wait_for_round=lambda: None,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            attempts,
+            [
+                ("fresh-session", {"tk": "fresh-token"}, "1", 1),
+                ("fresh-session", {"tk": "fresh-token"}, "2", 1),
+                ("fresh-session", {"tk": "fresh-token"}, "1", 1),
+            ],
+        )
 
 
 class TestRefreshContext(unittest.TestCase):
@@ -177,7 +252,7 @@ class TestRefreshContext(unittest.TestCase):
             select_target_time=lambda: datetime(2026, 8, 13, 10, 0, 0),
             run_countdown=lambda target: None,
             refresh_context=lambda credentials: (_ for _ in ()).throw(AuthenticationError("invalid")),
-            attempt_course=lambda course, attempt: attempts.append((course, attempt)),
+            attempt_course=lambda session, tokens, course, attempt: attempts.append((course, attempt)),
             wait_for_round=lambda: None,
         )
 
@@ -199,6 +274,25 @@ class TestPromptTargetTime(unittest.TestCase):
         target = prompt_target_time(now=now, questionary_module=prompts)
 
         self.assertEqual(target, now + timedelta(seconds=1))
+        self.assertEqual(len(prompts.text_calls), 3)
+
+    def test_revalidates_against_current_time_on_each_retry(self):
+        times = iter([
+            datetime(2026, 8, 13, 9, 0, 0),
+            datetime(2026, 8, 13, 9, 0, 2),
+            datetime(2026, 8, 13, 9, 0, 2),
+        ])
+        prompts = FakeQuestionary(
+            text_answers=[
+                "2026/08/13 09:00",
+                "2026-08-13 09:00:01",
+                "2026-08-13 09:00:03",
+            ]
+        )
+
+        target = prompt_target_time(now_fn=lambda: next(times), questionary_module=prompts)
+
+        self.assertEqual(target, datetime(2026, 8, 13, 9, 0, 3))
         self.assertEqual(len(prompts.text_calls), 3)
 
 
