@@ -6,3 +6,4 @@ network_capture.json
 network_login.json
 secrets.json
 .DS_Store
+.worktrees/
