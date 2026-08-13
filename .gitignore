@@ -1,9 +1,17 @@
 venv/
 __pycache__/
 *.pyc
+
+# Local credentials and secrets
 config.json
+secrets.json
+credential.key
+credentials.enc
+.env
+.env.*
+!.env.example
+
 network_capture.json
 network_login.json
-secrets.json
 .DS_Store
 .worktrees/
