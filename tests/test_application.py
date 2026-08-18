@@ -240,6 +240,25 @@ class TestModeSelection(unittest.TestCase):
         self.assertEqual(attempts, [])
 
 
+class TestTicketingPollWait(unittest.TestCase):
+    def test_ticketing_poll_wait_uses_uniform_point_seven_to_one_point_three(self):
+        wait_fn = getattr(main, "wait_for_ticketing_poll", None)
+        self.assertIsNotNone(wait_fn)
+        requested_ranges = []
+        sleeps = []
+
+        wait_fn(
+            sleep_fn=sleeps.append,
+            uniform_fn=lambda minimum, maximum: requested_ranges.append(
+                (minimum, maximum)
+            )
+            or 0.94,
+        )
+
+        self.assertEqual(requested_ranges, [(0.7, 1.3)])
+        self.assertEqual(sleeps, [0.94])
+
+
 class TestMainWiring(unittest.TestCase):
     def test_main_enables_quiet_wishlist_polling_and_terminal_renderer(self):
         captured = {}
@@ -265,6 +284,10 @@ class TestMainWiring(unittest.TestCase):
         self.assertEqual(polled, [{"suupNo": "1"}])
         self.assertEqual(fetches, [("session", {"tk": "token"}, False)])
         self.assertIsInstance(captured["ticketing_renderer"], main.TicketingPollRenderer)
+        self.assertIs(
+            captured["wait_for_round"],
+            getattr(main, "wait_for_ticketing_poll", None),
+        )
 
 
 class TestScheduledApplication(unittest.TestCase):

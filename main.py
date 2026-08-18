@@ -5,6 +5,7 @@ import base64
 import html as html_lib
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -117,6 +118,13 @@ class TicketingPollRenderer:
             self.stream.write("\n")
             self.stream.flush()
             self.active = False
+
+
+def wait_for_ticketing_poll(
+    sleep_fn=time.sleep,
+    uniform_fn=random.uniform,
+):
+    sleep_fn(uniform_fn(0.7, 1.3))
 
 
 def create_session(config):
@@ -1153,7 +1161,7 @@ def main():
         run_countdown=run_countdown,
         refresh_context=refresh_registration_context,
         attempt_course=attempt,
-        wait_for_round=lambda: time.sleep(0.5),
+        wait_for_round=wait_for_ticketing_poll,
         refresh_wishlist=lambda session, tokens: fetch_course_list(
             session,
             tokens,
