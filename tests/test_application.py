@@ -50,11 +50,36 @@ class FakeQuestionary:
 
 
 class TestModeSelection(unittest.TestCase):
+    def test_ticketing_poll_renderer_reuses_one_terminal_line(self):
+        output = io.StringIO()
+        renderer = main.TicketingPollRenderer(stream=output)
+        course = {
+            "haksuNo": "COE9016",
+            "sincheongInwon": "180",
+            "jehanInwon": "180",
+        }
+
+        renderer(1, [(course, "full")])
+        renderer(
+            2,
+            [({**course, "sincheongInwon": "179"}, "available")],
+        )
+        renderer.finish()
+
+        rendered = output.getvalue()
+        self.assertIn("[취케팅 조회 1] COE9016 180/180 만석", rendered)
+        self.assertIn("[취케팅 조회 2] COE9016 179/180 빈자리", rendered)
+        self.assertEqual(rendered.count("\n"), 1)
+
     def test_mode_menu_defaults_to_scheduled(self):
         prompts = FakeQuestionary(select_answers=["scheduled"])
 
         self.assertEqual(select_run_mode(prompts), "scheduled")
         self.assertEqual(prompts.select_calls[0]["default"], "scheduled")
+        self.assertIn(
+            "정원 조회",
+            prompts.select_calls[0]["choices"][1].title,
+        )
 
     def test_cancelled_mode_prompt_sends_no_registration_requests(self):
         courses = [{"suupNo": "30012", "haksuNo": "COE8042", "gwamokNm": "확률과통계"}]
@@ -74,6 +99,172 @@ class TestModeSelection(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(attempts, [])
+
+    def test_missing_token_after_login_returns_nonzero_without_traceback(self):
+        logs = []
+
+        with patch("main.log", side_effect=lambda message, color=None: logs.append(message)):
+            exit_code = run_application(
+                load_authentication=lambda: (
+                    {"user_id": "u", "password": "p"},
+                    "session",
+                ),
+                fetch_context=lambda session: (_ for _ in ()).throw(
+                    AuthenticationError("tk token not found")
+                ),
+                select_courses=lambda wishlist: self.fail("selection must not run"),
+                select_mode=lambda: self.fail("mode prompt must not run"),
+                select_target_time=lambda: self.fail("time prompt must not run"),
+                run_countdown=lambda target: self.fail("countdown must not run"),
+                refresh_context=lambda credentials: self.fail("refresh must not run"),
+                attempt_course=lambda session, tokens, course, attempt: self.fail(
+                    "registration must not run"
+                ),
+                wait_for_round=lambda: None,
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(any("토큰" in message for message in logs))
+
+    def test_direct_ticketing_polls_wishlist_before_attempt_and_confirms_registration(self):
+        selected = {
+            "suupNo": "30023",
+            "haksuNo": "COE9016",
+            "sincheongSuupCnt": 0,
+            "sincheongInwon": "180",
+            "jehanInwon": "180",
+        }
+        snapshots = [
+            [{**selected, "sincheongInwon": "180"}],
+            [{**selected, "sincheongInwon": "179", "marker": "available"}],
+            [{**selected, "sincheongSuupCnt": 1, "marker": "registered"}],
+        ]
+        refreshes = []
+        attempts = []
+        waits = []
+
+        class Renderer:
+            def __init__(self):
+                self.polls = []
+                self.finishes = 0
+
+            def __call__(self, poll_number, observations):
+                self.polls.append(
+                    (poll_number, [status for _course, status in observations])
+                )
+
+            def finish(self):
+                self.finishes += 1
+
+        renderer = Renderer()
+
+        def refresh_wishlist(session, tokens):
+            refreshes.append((session, tokens))
+            return snapshots.pop(0)
+
+        exit_code = run_application(
+            load_authentication=lambda: (
+                {"user_id": "u", "password": "p"},
+                "initial-session",
+            ),
+            fetch_context=lambda session: ({"tk": "initial-token"}, [selected]),
+            select_courses=lambda wishlist: [selected],
+            select_mode=lambda: "ticketing",
+            select_target_time=lambda: self.fail("time prompt must not run"),
+            run_countdown=lambda target: self.fail("countdown must not run"),
+            refresh_context=lambda credentials: self.fail("refresh must not run"),
+            attempt_course=lambda session, tokens, course, attempt: attempts.append(
+                (session, tokens, course.get("marker"), attempt)
+            )
+            or "success",
+            wait_for_round=lambda: waits.append("wait"),
+            refresh_wishlist=refresh_wishlist,
+            ticketing_renderer=renderer,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            refreshes,
+            [
+                ("initial-session", {"tk": "initial-token"}),
+                ("initial-session", {"tk": "initial-token"}),
+                ("initial-session", {"tk": "initial-token"}),
+            ],
+        )
+        self.assertEqual(
+            attempts,
+            [("initial-session", {"tk": "initial-token"}, "available", 1)],
+        )
+        self.assertEqual(waits, ["wait", "wait"])
+        self.assertEqual(
+            renderer.polls,
+            [(1, ["full"]), (2, ["available"]), (3, ["registered"])],
+        )
+        self.assertGreaterEqual(renderer.finishes, 2)
+
+    def test_direct_ticketing_blocks_when_only_registered_sibling_remains(self):
+        selected = {
+            "suupNo": "30012",
+            "haksuNo": "COE8042",
+            "sincheongSuupCnt": 0,
+            "sincheongInwon": "119",
+            "jehanInwon": "120",
+        }
+        registered_sibling = {
+            **selected,
+            "suupNo": "30011",
+            "sincheongSuupCnt": 1,
+        }
+        attempts = []
+
+        exit_code = run_application(
+            load_authentication=lambda: (
+                {"user_id": "u", "password": "p"},
+                "initial-session",
+            ),
+            fetch_context=lambda session: ({"tk": "initial-token"}, [selected]),
+            select_courses=lambda wishlist: [selected],
+            select_mode=lambda: "ticketing",
+            select_target_time=lambda: self.fail("time prompt must not run"),
+            run_countdown=lambda target: self.fail("countdown must not run"),
+            refresh_context=lambda credentials: self.fail("refresh must not run"),
+            attempt_course=lambda session, tokens, course, attempt: attempts.append(
+                (course, attempt)
+            )
+            or "success",
+            wait_for_round=lambda: self.fail("blocked course must not wait"),
+            refresh_wishlist=lambda session, tokens: [registered_sibling],
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(attempts, [])
+
+
+class TestMainWiring(unittest.TestCase):
+    def test_main_enables_quiet_wishlist_polling_and_terminal_renderer(self):
+        captured = {}
+        fetches = []
+
+        def fake_run_application(**kwargs):
+            captured.update(kwargs)
+            return 0
+
+        def fake_fetch(session, tokens, log_result=True):
+            fetches.append((session, tokens, log_result))
+            return [{"suupNo": "1"}]
+
+        with patch("main.run_application", side_effect=fake_run_application), patch(
+            "main.fetch_course_list", side_effect=fake_fetch
+        ), patch("main.log"), patch("main.sys.exit"):
+            main.main()
+            polled = captured["refresh_wishlist"](
+                "session",
+                {"tk": "token"},
+            )
+
+        self.assertEqual(polled, [{"suupNo": "1"}])
+        self.assertEqual(fetches, [("session", {"tk": "token"}, False)])
+        self.assertIsInstance(captured["ticketing_renderer"], main.TicketingPollRenderer)
 
 
 class TestScheduledApplication(unittest.TestCase):
@@ -242,6 +433,42 @@ class TestScheduledApplication(unittest.TestCase):
                 ("fresh-session", {"tk": "fresh-token"}, "1", 1),
             ],
         )
+
+    def test_scheduled_block_remains_nonzero_after_other_courses_finish_ticketing(self):
+        blocked = {"haksuNo": "CSE1001", "suupNo": "1"}
+        pending = {"haksuNo": "CSE1002", "suupNo": "2"}
+        courses = [blocked, pending]
+        attempts = []
+
+        def attempt(_session, _tokens, course, attempt_number):
+            attempts.append((course["suupNo"], attempt_number))
+            return "blocked" if course["suupNo"] == "1" else "retry"
+
+        exit_code = run_application(
+            load_authentication=lambda: (
+                {"user_id": "u", "password": "p"},
+                "initial-session",
+            ),
+            fetch_context=lambda session: ({"tk": "initial-token"}, courses),
+            select_courses=lambda wishlist: courses,
+            select_mode=lambda: "scheduled",
+            select_target_time=lambda: datetime(2026, 8, 13, 10, 0, 0),
+            run_countdown=lambda target: None,
+            refresh_context=lambda credentials: (
+                "fresh-session",
+                {"tk": "fresh-token"},
+                courses,
+            ),
+            attempt_course=attempt,
+            wait_for_round=lambda: None,
+            refresh_wishlist=lambda session, tokens: [
+                blocked,
+                {**pending, "sincheongSuupCnt": "1"},
+            ],
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(attempts, [("1", 1), ("2", 1)])
 
 
 class TestRefreshContext(unittest.TestCase):

@@ -2,6 +2,7 @@
 """한양대학교 수강신청 자동화 시스템"""
 
 import base64
+import html as html_lib
 import json
 import os
 import re
@@ -22,6 +23,7 @@ from workflow import (
     ScheduleValidationError,
     countdown_until,
     parse_target_time,
+    run_polling_ticketing,
     run_scheduled_pass,
     run_ticketing,
 )
@@ -80,6 +82,41 @@ def log(msg, color=None):
         print(f"{prefix} {colors[color]}{msg}{reset}")
     else:
         print(f"{prefix} {msg}")
+
+
+class TicketingPollRenderer:
+    def __init__(self, stream=None):
+        self.stream = stream or sys.stdout
+        self.active = False
+
+    def __call__(self, poll_number, observations):
+        details = []
+        for course, status in observations:
+            haksu_no = course.get("haksuNo", "?")
+            enrolled = course.get("sincheongInwon", "?")
+            limit = course.get("jehanInwon", "?")
+            if status == "registered":
+                detail = f"{haksu_no} 신청확인"
+            elif status == "available":
+                detail = f"{haksu_no} {enrolled}/{limit} 빈자리"
+            elif status == "full":
+                detail = f"{haksu_no} {enrolled}/{limit} 만석"
+            elif status == "blocked":
+                detail = f"{haksu_no} 타분반 신청됨"
+            else:
+                detail = f"{haksu_no} 조회불명"
+            details.append(detail)
+
+        line = f"[취케팅 조회 {poll_number}] " + " | ".join(details)
+        self.stream.write(f"\r\033[2K{line}")
+        self.stream.flush()
+        self.active = True
+
+    def finish(self):
+        if self.active:
+            self.stream.write("\n")
+            self.stream.flush()
+            self.active = False
 
 
 def create_session(config):
@@ -221,23 +258,40 @@ def login_with_sso(session, config):
 
 def extract_tokens(session):
     """sulg.do HTML에서 tk 토큰과 기타 파라미터를 추출한다."""
-    resp = session.get(f"{BASE_URL}/sulg.do")
-    html = resp.text
-
-    # tk 토큰 추출 (pgmId=P310298 관련)
-    tk_match = re.search(r"pgmId=P310298&menuId=M008958&tk=([a-f0-9]+)", html)
-    if not tk_match:
-        # 다른 패턴 시도
-        tk_match = re.search(r'tk=([a-f0-9]{64})', html)
+    token_pattern = r"[A-Za-z0-9._~-]{16,256}"
+    document = ""
+    tk_match = None
+    for path in ("/sulg.do", "/slgns.do?locale=ko"):
+        resp = session.get(f"{BASE_URL}{path}")
+        document = html_lib.unescape(resp.text)
+        document = (
+            document.replace("\\u0026", "&")
+            .replace("\\x26", "&")
+            .replace("\\u003d", "=")
+            .replace("\\x3d", "=")
+        )
+        tk_match = re.search(
+            rf"(?:[?&])tk\s*=\s*({token_pattern})",
+            document,
+            re.IGNORECASE,
+        )
+        if not tk_match:
+            tk_match = re.search(
+                rf"\btk\s*[:=]\s*['\"]({token_pattern})['\"]",
+                document,
+                re.IGNORECASE,
+            )
+        if tk_match:
+            break
     if not tk_match:
         log("tk 토큰을 찾을 수 없습니다.", "red")
-        sys.exit(1)
+        raise AuthenticationError("tk token not found")
 
     tk = tk_match.group(1)
 
     # 사용자 정보 추출
-    gaein_match = re.search(r'gaeinNo\s*:\s*"(\d+)"', html)
-    sosok_match = re.search(r'sosokCd\s*:\s*"([^"]+)"', html)
+    gaein_match = re.search(r'gaeinNo\s*:\s*"(\d+)"', document)
+    sosok_match = re.search(r'sosokCd\s*:\s*"([^"]+)"', document)
     info = {
         "tk": tk,
         "pgmId": "P310298",
@@ -329,22 +383,25 @@ def release_netfunnel_key(session, key):
         pass
 
 
-def fetch_course_list(session, tokens):
+def fetch_course_list(session, tokens, log_result=True):
     """희망수업 목록을 조회한다."""
     url = f"{BASE_URL}/SgscAct/findHeemangSuupSearchs.do?pgmId={tokens['pgmId']}&menuId={tokens['menuId']}&tk={tokens['tk']}"
     data = {"strJojikGb": "2", "strGrade": "3"}
 
     resp = session.post(url, json=data, headers=AJAX_HEADERS)
     result = resp.json()
+    if not isinstance(result, dict):
+        raise requests.RequestException("invalid wishlist response")
 
     courses = []
     ds = result.get("DS_SUUPGG03TTM01", [{}])
     if ds and "list" in ds[0]:
         courses = ds[0]["list"]
 
-    log(f"희망수업 {len(courses)}개 조회됨", "cyan")
-    for c in courses:
-        log(f"  {c.get('haksuNo', '?')} - {c.get('gwamokNm', '?')} (수업번호: {c.get('suupNo', '?')})", "cyan")
+    if log_result:
+        log(f"희망수업 {len(courses)}개 조회됨", "cyan")
+        for c in courses:
+            log(f"  {c.get('haksuNo', '?')} - {c.get('gwamokNm', '?')} (수업번호: {c.get('suupNo', '?')})", "cyan")
 
     return courses
 
@@ -471,11 +528,53 @@ def run_registration_round_robin(
 
 def classify_registration_result(out_code, out_msg):
     """수강신청 응답을 라운드 로빈 실행 상태로 변환한다."""
+    if "중복" in out_msg and "신청" in out_msg:
+        return "blocked"
     if "이미" in out_msg and "신청" in out_msg:
         return "success"
-    if out_code in ("", "SUCCESS", "S") or "성공" in out_msg or "완료" in out_msg:
+    if out_code in ("SUCCESS", "S") or "성공" in out_msg or "완료" in out_msg:
         return "success"
     return "retry"
+
+
+def _parse_nonnegative_count(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        count = int(str(value).strip().replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    return count if count >= 0 else None
+
+
+def classify_ticketing_course(course, courses=None):
+    """희망수업 조회값으로 신청 여부와 잔여석 상태를 판정한다."""
+    registered_count = _parse_nonnegative_count(course.get("sincheongSuupCnt"))
+    enrolled_count = _parse_nonnegative_count(course.get("sincheongInwon"))
+    limit_count = _parse_nonnegative_count(course.get("jehanInwon"))
+
+    if registered_count is not None and registered_count > 0:
+        return "registered"
+    if courses is not None:
+        haksu_no = course.get("haksuNo")
+        suup_no = str(course.get("suupNo"))
+        for sibling in courses:
+            if sibling.get("haksuNo") != haksu_no:
+                continue
+            if str(sibling.get("suupNo")) == suup_no:
+                continue
+            sibling_count = _parse_nonnegative_count(
+                sibling.get("sincheongSuupCnt")
+            )
+            if sibling_count is not None and sibling_count > 0:
+                return "blocked"
+    if registered_count is None:
+        return "unknown"
+    if enrolled_count is None or limit_count is None or limit_count == 0:
+        return "unknown"
+    if enrolled_count < limit_count:
+        return "available"
+    return "full"
 
 
 def register_course(session, tokens, course_info, nf_key):
@@ -501,6 +600,8 @@ def register_course(session, tokens, course_info, nf_key):
 
     resp = session.post(url, json=data, headers=AJAX_HEADERS)
     result = resp.json()
+    if not isinstance(result, dict):
+        raise requests.RequestException("invalid registration response")
 
     out_code = result.get("outCode", "")
     out_msg = result.get("outMsg", "")
@@ -616,7 +717,7 @@ def select_run_mode(questionary_module=None):
             value="scheduled",
         ),
         questionary_module.Choice(
-            "바로 취케팅 — 성공할 때까지 무제한 순회",
+            "바로 취케팅 — 정원 조회 후 빈자리 과목 신청",
             value="ticketing",
         ),
     ]
@@ -860,6 +961,8 @@ def attempt_registration_course(
     status = classify_registration_result(out_code, out_msg)
     if status == "success":
         log(f"수강신청 성공: {haksu_no} - {gwamok_nm}", "green")
+    elif status == "blocked":
+        log(f"중복 과목으로 신청 중단: {haksu_no} - {gwamok_nm}", "yellow")
     else:
         log(f"수강신청 실패, 재시도 대기: {haksu_no} - {gwamok_nm}", "yellow")
     return status
@@ -867,9 +970,16 @@ def attempt_registration_course(
 
 def print_registration_summary(label, summary):
     log(
-        f"{label} 완료 {len(summary.completed)}개, 대기 {len(summary.pending)}개",
+        f"{label} 완료 {len(summary.completed)}개, "
+        f"대기 {len(summary.pending)}개, 중단 {len(summary.blocked)}개",
         "cyan",
     )
+    for course in summary.blocked:
+        log(
+            f"중복 과목으로 중단: {course.get('haksuNo', '?')} - "
+            f"{course.get('gwamokNm', '?')} (수업번호 {course.get('suupNo', '?')})",
+            "yellow",
+        )
     if summary.interrupted:
         log(f"{label} 중단됨", "yellow")
 
@@ -884,6 +994,8 @@ def run_application(
     refresh_context,
     attempt_course,
     wait_for_round,
+    refresh_wishlist=None,
+    ticketing_renderer=None,
 ):
     try:
         credentials, session = load_authentication()
@@ -891,7 +1003,11 @@ def run_application(
         log(f"인증을 완료하지 못했습니다: {error}", "red")
         return 1
 
-    tokens, wishlist = fetch_context(session)
+    try:
+        tokens, wishlist = fetch_context(session)
+    except AuthenticationError as error:
+        log(f"수강신청 토큰을 불러오지 못했습니다: {error}", "red")
+        return 1
     if not wishlist:
         log("희망수업이 없습니다. 포털에서 희망수업을 먼저 등록해주세요.", "red")
         return 1
@@ -909,17 +1025,48 @@ def run_application(
         log("알 수 없는 실행 모드입니다.", "red")
         return 1
 
+    def run_ticketing_for_context(courses, active_session, active_tokens, attempt):
+        if refresh_wishlist is None:
+            return run_ticketing(
+                courses,
+                attempt_course=attempt,
+                wait_for_next_round=wait_for_round,
+            )
+
+        def poll_courses():
+            try:
+                return refresh_wishlist(active_session, active_tokens)
+            except requests.RequestException as error:
+                log(f"정원 조회 오류: {error}. 다음 조회에서 재시도합니다.", "yellow")
+                return []
+
+        return run_polling_ticketing(
+            courses,
+            poll_courses=poll_courses,
+            classify_course=classify_ticketing_course,
+            attempt_course=attempt,
+            wait_for_next_poll=wait_for_round,
+            on_poll=ticketing_renderer,
+        )
+
+    def finish_ticketing_line():
+        if ticketing_renderer is not None:
+            ticketing_renderer.finish()
+
     if mode == "ticketing":
         def attempt_with_initial_context(course, attempt_number):
+            finish_ticketing_line()
             return attempt_course(session, tokens, course, attempt_number)
 
-        summary = run_ticketing(
+        summary = run_ticketing_for_context(
             selected,
-            attempt_course=attempt_with_initial_context,
-            wait_for_next_round=wait_for_round,
+            session,
+            tokens,
+            attempt_with_initial_context,
         )
+        finish_ticketing_line()
         print_registration_summary("취케팅", summary)
-        return 1 if summary.interrupted else 0
+        return 1 if summary.interrupted or summary.blocked else 0
 
     target = select_target_time()
     if target is None:
@@ -945,6 +1092,7 @@ def run_application(
         return 1
 
     def attempt_with_fresh_context(course, attempt_number):
+        finish_ticketing_line()
         return attempt_course(fresh_session, fresh_tokens, course, attempt_number)
 
     scheduled_summary = run_scheduled_pass(scheduled_courses, attempt_with_fresh_context)
@@ -953,13 +1101,19 @@ def run_application(
         return 1
 
     if scheduled_summary.pending:
-        ticketing_summary = run_ticketing(
+        ticketing_summary = run_ticketing_for_context(
             scheduled_summary.pending,
-            attempt_course=attempt_with_fresh_context,
-            wait_for_next_round=wait_for_round,
+            fresh_session,
+            fresh_tokens,
+            attempt_with_fresh_context,
         )
+        finish_ticketing_line()
         print_registration_summary("취케팅", ticketing_summary)
-        if ticketing_summary.interrupted:
+        if (
+            scheduled_summary.blocked
+            or ticketing_summary.interrupted
+            or ticketing_summary.blocked
+        ):
             return 1
         if unresolved:
             log(f"새 희망수업 목록에서 찾지 못한 과목 {len(unresolved)}개가 남았습니다.", "yellow")
@@ -970,11 +1124,12 @@ def run_application(
         log(f"새 희망수업 목록에서 찾지 못한 과목 {len(unresolved)}개가 남았습니다.", "yellow")
         return 1
 
-    return 0
+    return 1 if scheduled_summary.blocked else 0
 
 
 def main():
     log("=== 한양대학교 수강신청 자동화 ===", "cyan")
+    ticketing_renderer = TicketingPollRenderer()
 
     def fetch_initial_context(session):
         tokens = extract_tokens(session)
@@ -999,7 +1154,14 @@ def main():
         refresh_context=refresh_registration_context,
         attempt_course=attempt,
         wait_for_round=lambda: time.sleep(0.5),
+        refresh_wishlist=lambda session, tokens: fetch_course_list(
+            session,
+            tokens,
+            log_result=False,
+        ),
+        ticketing_renderer=ticketing_renderer,
     )
+    ticketing_renderer.finish()
     log(f"\n{'='*50}", "cyan")
     log("수강신청 자동화 완료", "cyan")
     sys.exit(exit_code)

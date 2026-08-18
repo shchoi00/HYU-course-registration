@@ -12,6 +12,7 @@ from workflow import (
     countdown_until,
     format_remaining,
     parse_target_time,
+    run_polling_ticketing,
     run_scheduled_pass,
     run_ticketing,
 )
@@ -161,11 +162,24 @@ class TestWorkflowModes(unittest.TestCase):
             completed=[self.courses[0]],
             pending=[self.courses[1]],
             interrupted=True,
+            blocked=[self.courses[2]],
         )
 
         self.assertEqual(summary.completed, [self.courses[0]])
         self.assertEqual(summary.pending, [self.courses[1]])
+        self.assertEqual(summary.blocked, [self.courses[2]])
         self.assertTrue(summary.interrupted)
+
+    def test_scheduled_pass_returns_duplicate_course_as_blocked(self):
+        summary = run_scheduled_pass(
+            [self.courses[0]],
+            lambda _course, _attempt: "blocked",
+        )
+
+        self.assertEqual(summary.completed, [])
+        self.assertEqual(summary.pending, [])
+        self.assertEqual(summary.blocked, [self.courses[0]])
+        self.assertFalse(summary.interrupted)
 
     def test_scheduled_pass_attempts_once_and_returns_only_failures(self):
         outcomes = {"1": "retry", "2": "success", "3": "retry"}
@@ -228,6 +242,125 @@ class TestWorkflowModes(unittest.TestCase):
         self.assertEqual(summary.pending, [])
         self.assertFalse(summary.interrupted)
         self.assertEqual(len(waits), 11)
+
+    def test_ticketing_polls_capacity_and_attempts_only_available_courses(self):
+        snapshots = [
+            [
+                {**self.courses[0], "availability": "full", "marker": "poll-1"},
+                {**self.courses[1], "availability": "full", "marker": "poll-1"},
+            ],
+            [
+                {**self.courses[0], "availability": "available", "marker": "poll-2"},
+                {**self.courses[1], "availability": "full", "marker": "poll-2"},
+            ],
+            [
+                {**self.courses[0], "availability": "registered", "marker": "poll-3"},
+                {**self.courses[1], "availability": "available", "marker": "poll-3"},
+            ],
+            [
+                {**self.courses[0], "availability": "registered", "marker": "poll-4"},
+                {**self.courses[1], "availability": "registered", "marker": "poll-4"},
+            ],
+        ]
+        attempts = []
+        waits = []
+        polls = []
+
+        def poll_courses():
+            polls.append("poll")
+            return snapshots.pop(0)
+
+        summary = run_polling_ticketing(
+            self.courses[:2],
+            poll_courses=poll_courses,
+            classify_course=lambda course, _courses: course["availability"],
+            attempt_course=lambda course, attempt: attempts.append(
+                (course["suupNo"], course["marker"], attempt)
+            )
+            or "success",
+            wait_for_next_poll=lambda: waits.append("wait"),
+        )
+
+        self.assertEqual(
+            attempts,
+            [("1", "poll-2", 1), ("2", "poll-3", 1)],
+        )
+        self.assertEqual(len(polls), 4)
+        self.assertEqual(len(waits), 3)
+        self.assertEqual(
+            [course["suupNo"] for course in summary.completed],
+            ["1", "2"],
+        )
+        self.assertEqual(summary.pending, [])
+        self.assertEqual(summary.blocked, [])
+
+    def test_ticketing_stops_polling_course_classified_as_blocked(self):
+        blocked = {**self.courses[0], "availability": "blocked"}
+        attempts = []
+
+        summary = run_polling_ticketing(
+            [self.courses[0]],
+            poll_courses=lambda: [blocked],
+            classify_course=lambda course, _courses: course["availability"],
+            attempt_course=lambda course, attempt: attempts.append((course, attempt))
+            or "success",
+        )
+
+        self.assertEqual(attempts, [])
+        self.assertEqual(summary.completed, [])
+        self.assertEqual(summary.pending, [])
+        self.assertEqual(summary.blocked, [blocked])
+
+    def test_ticketing_blocks_missing_section_when_registered_sibling_is_found(self):
+        selected = self.courses[0]
+        registered_sibling = {
+            **selected,
+            "suupNo": "99",
+            "registered": True,
+        }
+        attempts = []
+
+        def classify(course, courses):
+            sibling_registered = any(
+                candidate.get("haksuNo") == course.get("haksuNo")
+                and candidate.get("suupNo") != course.get("suupNo")
+                and candidate.get("registered")
+                for candidate in courses
+            )
+            return "blocked" if sibling_registered else "unknown"
+
+        summary = run_polling_ticketing(
+            [selected],
+            poll_courses=lambda: [registered_sibling],
+            classify_course=classify,
+            attempt_course=lambda course, attempt: attempts.append((course, attempt))
+            or "success",
+            wait_for_next_poll=lambda: (_ for _ in ()).throw(KeyboardInterrupt),
+        )
+
+        self.assertEqual(attempts, [])
+        self.assertEqual(summary.completed, [])
+        self.assertEqual(summary.pending, [])
+        self.assertEqual(summary.blocked, [selected])
+
+    def test_ticketing_never_attempts_from_stale_capacity_when_section_is_missing(self):
+        selected = {**self.courses[0], "availability": "available"}
+        attempts = []
+
+        summary = run_polling_ticketing(
+            [selected],
+            poll_courses=list,
+            classify_course=lambda course, _courses: course["availability"],
+            attempt_course=lambda course, attempt: attempts.append((course, attempt))
+            or "success",
+            wait_for_next_poll=lambda: (_ for _ in ()).throw(KeyboardInterrupt),
+        )
+
+        self.assertEqual(attempts, [])
+        self.assertEqual(summary.completed, [])
+        self.assertEqual(summary.pending, [selected])
+        self.assertEqual(summary.blocked, [])
+        self.assertTrue(summary.interrupted)
 
     def test_ticketing_returns_pending_summary_on_keyboard_interrupt(self):
         calls = []

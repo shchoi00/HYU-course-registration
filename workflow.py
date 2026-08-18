@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import math
 from calendar import monthrange
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import ClassVar, Literal, Optional
 
-AttemptStatus = Literal["success", "retry"]
+AttemptStatus = Literal["success", "retry", "blocked"]
+CoursePollStatus = Literal["registered", "available", "full", "unknown", "blocked"]
 
 
 @dataclass
@@ -14,6 +15,7 @@ class RegistrationSummary:
     completed: list[dict]
     pending: list[dict]
     interrupted: bool
+    blocked: list[dict] = field(default_factory=list)
 
 
 class ScheduleValidationError(ValueError):
@@ -147,6 +149,11 @@ def _summary_from_states(states, interrupted=False):
             if state["status"] == "pending"
         ],
         interrupted=interrupted,
+        blocked=[
+            state["course"]
+            for state in states
+            if state["status"] == "blocked"
+        ],
     )
 
 
@@ -155,6 +162,8 @@ def _apply_attempt_result(state, status):
         state["status"] = "success"
     elif status == "retry":
         state["status"] = "pending"
+    elif status == "blocked":
+        state["status"] = "blocked"
     else:
         raise ValueError(f"알 수 없는 신청 상태: {status}")
 
@@ -200,6 +209,78 @@ def run_ticketing(
 
             if any(state["status"] == "pending" for state in states):
                 wait_for_next_round()
+    except KeyboardInterrupt:
+        return _summary_from_states(states, interrupted=True)
+
+    return _summary_from_states(states)
+
+
+def run_polling_ticketing(
+    courses,
+    poll_courses,
+    classify_course,
+    attempt_course,
+    wait_for_next_poll=lambda: None,
+    on_poll=None,
+) -> RegistrationSummary:
+    states = _new_states(courses)
+    poll_number = 0
+
+    try:
+        while any(state["status"] == "pending" for state in states):
+            poll_number += 1
+            refreshed_courses = poll_courses()
+            refreshed = {
+                str(course.get("suupNo")): course
+                for course in refreshed_courses
+            }
+            observations = []
+            available = []
+
+            for state in states:
+                if state["status"] != "pending":
+                    continue
+                course = refreshed.get(str(state["course"].get("suupNo")))
+                observed_course = course or state["course"]
+                poll_status: CoursePollStatus = classify_course(
+                    observed_course,
+                    refreshed_courses,
+                )
+                if course is None and poll_status != "blocked":
+                    poll_status = "unknown"
+                if poll_status not in (
+                    "registered",
+                    "available",
+                    "full",
+                    "unknown",
+                    "blocked",
+                ):
+                    raise ValueError(f"알 수 없는 조회 상태: {poll_status}")
+
+                observations.append((observed_course, poll_status))
+                if poll_status == "registered":
+                    state["course"] = observed_course
+                    state["status"] = "success"
+                elif poll_status == "blocked":
+                    state["course"] = observed_course
+                    state["status"] = "blocked"
+                elif poll_status == "available":
+                    available.append((state, observed_course))
+
+            if on_poll is not None:
+                on_poll(poll_number, observations)
+
+            for state, course in available:
+                state["attempts"] += 1
+                status: AttemptStatus = attempt_course(course, state["attempts"])
+                if status == "blocked":
+                    state["course"] = course
+                    state["status"] = "blocked"
+                elif status not in ("success", "retry"):
+                    raise ValueError(f"알 수 없는 신청 상태: {status}")
+
+            if any(state["status"] == "pending" for state in states):
+                wait_for_next_poll()
     except KeyboardInterrupt:
         return _summary_from_states(states, interrupted=True)
 

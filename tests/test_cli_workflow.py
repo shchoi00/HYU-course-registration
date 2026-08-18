@@ -10,13 +10,16 @@ import requests
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import main
 from credentials import CredentialPaths, CredentialStore
 from main import (
     AuthenticationError,
     attempt_registration_course,
     classify_registration_result,
+    extract_tokens,
     load_authentication,
     order_courses_by_priority,
+    register_course,
     run_application,
     select_target_courses,
 )
@@ -70,7 +73,165 @@ class TestCoursePriority(unittest.TestCase):
         )
 
 
+class TestCourseListFetch(unittest.TestCase):
+    def test_polling_fetch_returns_courses_without_writing_repeated_logs(self):
+        course = {
+            "haksuNo": "COE9016",
+            "suupNo": "30023",
+            "gwamokNm": "SF영화와철학적사고실험",
+            "sincheongSuupCnt": 0,
+            "sincheongInwon": "180",
+            "jehanInwon": "180",
+        }
+
+        class Response:
+            @staticmethod
+            def json():
+                return {"DS_SUUPGG03TTM01": [{"list": [course]}]}
+
+        class Session:
+            @staticmethod
+            def post(_url, json, headers):
+                return Response()
+
+        logs = []
+        with patch("main.log", side_effect=lambda *args: logs.append(args)):
+            courses = main.fetch_course_list(
+                Session(),
+                {"pgmId": "p", "menuId": "m", "tk": "t"},
+                log_result=False,
+            )
+
+        self.assertEqual(courses, [course])
+        self.assertEqual(logs, [])
+
+    def test_non_object_wishlist_response_is_a_retryable_request_error(self):
+        class Response:
+            @staticmethod
+            def json():
+                return []
+
+        class Session:
+            @staticmethod
+            def post(_url, json, headers):
+                return Response()
+
+        with self.assertRaises(requests.RequestException):
+            main.fetch_course_list(
+                Session(),
+                {"pgmId": "p", "menuId": "m", "tk": "t"},
+                log_result=False,
+            )
+
+
+class TestTokenExtraction(unittest.TestCase):
+    def test_extracts_url_safe_token_with_html_entities_and_mixed_case(self):
+        class Response:
+            text = (
+                'url: "openPage.do?pgmId=P320035&amp;tk=AbC_123-XyZ.9876543210"; '
+                'gaeinNo: "2026123456"; sosokCd: "H0001"'
+            )
+
+        class Session:
+            @staticmethod
+            def get(_url):
+                return Response()
+
+        tokens = extract_tokens(Session())
+
+        self.assertEqual(tokens["tk"], "AbC_123-XyZ.9876543210")
+        self.assertEqual(tokens["gaeinNo"], "2026123456")
+        self.assertEqual(tokens["sosokCd"], "H0001")
+
+    def test_retries_token_extraction_through_login_landing_page(self):
+        class Response:
+            def __init__(self, text):
+                self.text = text
+
+        class Session:
+            def __init__(self):
+                self.urls = []
+
+            def get(self, url):
+                self.urls.append(url)
+                if url.endswith("/sulg.do"):
+                    return Response("<html><body>메뉴 준비 중</body></html>")
+                return Response(
+                    'url: "openPage.do?pgmId=P320035&tk=retry_TOKEN-1234567890"'
+                )
+
+        session = Session()
+        tokens = extract_tokens(session)
+
+        self.assertEqual(tokens["tk"], "retry_TOKEN-1234567890")
+        self.assertEqual(
+            session.urls,
+            [
+                f"{main.BASE_URL}/sulg.do",
+                f"{main.BASE_URL}/slgns.do?locale=ko",
+            ],
+        )
+
+    def test_missing_token_raises_authentication_error_instead_of_exiting_process(self):
+        class Response:
+            text = "<html><body>수강신청 메인</body></html>"
+
+        class Session:
+            @staticmethod
+            def get(_url):
+                return Response()
+
+        with self.assertRaisesRegex(AuthenticationError, "token"):
+            extract_tokens(Session())
+
+
 class TestTicketingRegistration(unittest.TestCase):
+    def test_non_object_registration_response_is_a_retryable_request_error(self):
+        class Response:
+            @staticmethod
+            def json():
+                return []
+
+        class Session:
+            @staticmethod
+            def post(_url, json, headers):
+                return Response()
+
+        with self.assertRaises(requests.RequestException):
+            register_course(
+                Session(),
+                {"pgmId": "p", "menuId": "m", "tk": "t"},
+                {"suupNo": "30023"},
+                "nf-key",
+            )
+
+    def test_duplicate_course_attempt_logs_terminal_block_instead_of_retry(self):
+        course = {
+            "haksuNo": "COE8042",
+            "suupNo": "30012",
+            "gwamokNm": "확률과통계",
+        }
+        logs = []
+
+        with patch("main.log", side_effect=lambda message, color=None: logs.append(message)):
+            status = attempt_registration_course(
+                object(),
+                {"tk": "token"},
+                course,
+                1,
+                get_key_fn=lambda session: "nf-key",
+                register_fn=lambda session, tokens, selected, key: (
+                    "MSG",
+                    "수업과목을 중복 신청하였습니다. 수강신청 내역을 확인하여 주십시오",
+                    {},
+                ),
+                release_key_fn=lambda session, key: None,
+            )
+
+        self.assertEqual(status, "blocked")
+        self.assertTrue(any("중복 과목" in message and "중단" in message for message in logs))
+        self.assertFalse(any("재시도 대기" in message for message in logs))
+
     def test_transient_request_error_does_not_skip_later_courses(self):
         courses = [
             {"haksuNo": "CSE1001", "suupNo": "10001", "gwamokNm": "1순위"},
@@ -269,6 +430,18 @@ class TestRegistrationResultClassification(unittest.TestCase):
             "success",
         )
 
+    def test_empty_response_is_retried_instead_of_reported_as_success(self):
+        self.assertEqual(classify_registration_result("", ""), "retry")
+
+    def test_duplicate_course_response_is_blocked_instead_of_retried(self):
+        self.assertEqual(
+            classify_registration_result(
+                "MSG",
+                "수업과목을 중복 신청하였습니다. 수강신청 내역을 확인하여 주십시오",
+            ),
+            "blocked",
+        )
+
     def test_registration_period_response_is_retried(self):
         self.assertEqual(
             classify_registration_result("M77", "수강신청 기간이 아닙니다."),
@@ -279,6 +452,77 @@ class TestRegistrationResultClassification(unittest.TestCase):
         self.assertEqual(
             classify_registration_result("E99", "일시적인 오류입니다."),
             "retry",
+        )
+
+
+class TestTicketingCourseClassification(unittest.TestCase):
+    def test_classifies_registration_and_capacity_from_wishlist_counts(self):
+        cases = [
+            (
+                {"sincheongSuupCnt": 1, "sincheongInwon": "120", "jehanInwon": "120"},
+                "registered",
+            ),
+            (
+                {"sincheongSuupCnt": 0, "sincheongInwon": "180", "jehanInwon": "180"},
+                "full",
+            ),
+            (
+                {"sincheongSuupCnt": 0, "sincheongInwon": "179", "jehanInwon": "180"},
+                "available",
+            ),
+            (
+                {"sincheongSuupCnt": 0, "sincheongInwon": None, "jehanInwon": "180"},
+                "unknown",
+            ),
+        ]
+
+        for course, expected in cases:
+            with self.subTest(course=course):
+                self.assertEqual(main.classify_ticketing_course(course), expected)
+
+    def test_blocks_selected_section_when_another_section_is_already_registered(self):
+        selected = {
+            "haksuNo": "COE8042",
+            "suupNo": "30012",
+            "sincheongSuupCnt": 0,
+            "sincheongInwon": "120",
+            "jehanInwon": "120",
+        }
+        registered_sibling = {
+            "haksuNo": "COE8042",
+            "suupNo": "30011",
+            "sincheongSuupCnt": 1,
+            "sincheongInwon": "120",
+            "jehanInwon": "120",
+        }
+
+        self.assertEqual(
+            main.classify_ticketing_course(
+                selected,
+                [selected, registered_sibling],
+            ),
+            "blocked",
+        )
+
+    def test_blocks_missing_selected_section_when_registered_sibling_remains(self):
+        selected = {
+            "haksuNo": "COE8042",
+            "suupNo": "30012",
+        }
+        registered_sibling = {
+            "haksuNo": "COE8042",
+            "suupNo": "30011",
+            "sincheongSuupCnt": 1,
+            "sincheongInwon": "120",
+            "jehanInwon": "120",
+        }
+
+        self.assertEqual(
+            main.classify_ticketing_course(
+                selected,
+                [registered_sibling],
+            ),
+            "blocked",
         )
 
 
